@@ -1,0 +1,45 @@
+{
+  "orders": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "target_viewpoint": "pitchOctave",
+  "use_ppm": false,
+  "ppm_excluded_count": 1,
+  "ppm_escape_method": "c",
+  "ppm_reset_escape_on_unseen": false,
+  "ppm_ltm_exclusion": true,
+  "ppm_stm_exclusion": true,
+  "ppm_ltm_update_exclusion": false,
+  "ppm_stm_update_exclusion": true,
+  "eta_ltm": 0.0,
+  "eta_stm": 0.0,
+  "eta_max_depth": 15,
+  "viewpoint_config": {
+    "pitch": false,
+    "octave": false,
+    "midi_number": true,
+    "duration": false,
+    "length": false,
+    "offset": false,
+    "interval": false,
+    "bioi_ratio": false,
+    "beat_duration": 1.0,
+    "enharmony": true,
+    "token_round_ndigits": null
+  },
+  "viewpoint_spec": {
+    "name": "midi_number",
+    "kind": "basic",
+    "components": [
+      "midi_number"
+    ],
+    "typeset": [
+      "pitch"
+    ],
+    "links": []
+  }
+}

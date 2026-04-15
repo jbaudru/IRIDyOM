@@ -3,17 +3,14 @@
 # Core music processing
 music21>=7.1.0
 mido>=1.3.0
-pretty_midi>=0.2.10
 
 # Graph and data processing
 networkx>=3.0
 numpy>=1.24.0
 scipy>=1.10.0
-pandas>=1.5.0
 
 # Utilities
 tqdm>=4.65.0
-natsort>=8.0.0
 
-# Optional: For training from MIDI files
+# Optional: For visualization and IC plot export
 matplotlib>=3.7.0

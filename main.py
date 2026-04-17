@@ -19,6 +19,7 @@ import math
 import signal
 from pathlib import Path
 from collections import deque
+from urllib.parse import unquote, urlparse
 
 try:
 	import matplotlib.pyplot as plt
@@ -273,6 +274,102 @@ def ensure_programdata_directories():
 	return programdata
 
 
+def _strip_wrapping_quotes(value):
+	"""Strip quote wrappers often added by Max around paths with spaces."""
+	value = str(value or '').strip().replace('\x00', '')
+	while len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+		value = value[1:-1].strip()
+	return value
+
+
+def _client_path_to_string(path_value):
+	"""Normalize path text received over the Max/Node bridge."""
+	if isinstance(path_value, (list, tuple)):
+		raw = ' '.join(str(part) for part in path_value if part is not None)
+	else:
+		raw = str(path_value)
+	raw = _strip_wrapping_quotes(raw)
+	if not raw:
+		return raw
+
+	if raw.lower().startswith('file://'):
+		parsed = urlparse(raw)
+		url_path = unquote(parsed.path)
+		if sys.platform == 'win32' and len(url_path) >= 3 and url_path[0] == '/' and url_path[2] == ':':
+			url_path = url_path[1:]
+		if parsed.netloc and parsed.netloc.lower() != 'localhost':
+			if sys.platform == 'win32':
+				url_path = f"//{parsed.netloc}{url_path}"
+		raw = url_path
+	elif '%' in raw:
+		try:
+			raw = unquote(raw)
+		except Exception:
+			pass
+
+	return raw.replace('\\ ', ' ')
+
+
+def _looks_like_windows_drive_path(raw):
+	return len(raw) >= 3 and raw[1] == ':' and raw[0].isalpha() and raw[2] in ('/', '\\')
+
+
+def _mac_volume_path_candidates(raw):
+	"""Return candidates for Max's older HFS-style macOS paths."""
+	if sys.platform != 'darwin' or ':' not in raw or _looks_like_windows_drive_path(raw):
+		return []
+	if raw.startswith(('/', '~')):
+		return []
+
+	volume, rest = raw.split(':', 1)
+	if not volume or '/' in volume or '\\' in volume:
+		return []
+
+	rest = rest.replace(':', '/')
+	if rest.startswith('/'):
+		return [Path(rest), Path('/Volumes') / volume / rest.lstrip('/')]
+	return [Path('/') / rest, Path('/Volumes') / volume / rest]
+
+
+def _windows_to_posix_path_candidates(raw):
+	"""Map common dragged Windows-style user paths when running on macOS/Linux."""
+	if os.name == 'nt' or not _looks_like_windows_drive_path(raw):
+		return []
+
+	without_drive = raw[2:].replace('\\', '/')
+	if without_drive.startswith('/Users/') or without_drive.startswith('/Volumes/'):
+		return [Path(without_drive)]
+	return []
+
+
+def normalize_client_path(path_value):
+	"""Return an OS-native Path for paths sent by Max/Ableton."""
+	raw = _client_path_to_string(path_value)
+	candidates = _mac_volume_path_candidates(raw) + _windows_to_posix_path_candidates(raw) + [Path(raw)]
+
+	seen = set()
+	unique_candidates = []
+	for candidate in candidates:
+		key = str(candidate)
+		if key not in seen:
+			seen.add(key)
+			unique_candidates.append(candidate)
+
+	for candidate in unique_candidates:
+		try:
+			resolved = candidate.expanduser().resolve()
+		except Exception:
+			resolved = candidate.expanduser()
+		if resolved.exists():
+			return resolved
+
+	first = unique_candidates[0].expanduser()
+	try:
+		return first.resolve()
+	except Exception:
+		return first
+
+
 def parse_midi_file(file_path):
 	"""Parse MIDI file and extract note sequence with durations and intervals.
 	
@@ -287,7 +384,8 @@ def parse_midi_file(file_path):
 		return None
 	
 	try:
-		mid = mido.MidiFile(file_path)
+		midi_path = normalize_client_path(file_path)
+		mid = mido.MidiFile(str(midi_path))
 		note_events = []
 		note_on_stack = []  # Track open note_on events
 		
@@ -389,18 +487,11 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		return
 	
-	# Convert to string if needed
-	input_file = str(input_file)
-	output_folder = str(output_folder)
-	
-	input_path = Path(input_file).resolve()
-	output_path = Path(output_folder).resolve()
+	input_path = normalize_client_path(input_file)
+	output_path = normalize_client_path(output_folder)
 
 	# Check if file exists with alternative methods
 	if not input_path.exists():
-		# Try with string path directly
-		import os
-
 		response = {"type": "error", "message": f"Input file not found: {input_path}"}
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		add_log(f"  [{addr[1]}] Error: Input file not found: {input_path}")
@@ -642,7 +733,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 	
 	# Ensure output folder exists
 	try:
-		output_path = Path(output_folder).resolve()
+		output_path = normalize_client_path(output_folder)
 		output_path.mkdir(parents=True, exist_ok=True)
 	except Exception as e:
 		response = {"type": "error", "message": f"Could not create output folder: {e}"}
@@ -661,8 +752,9 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 	add_log(f"  [{addr[1]}] Variate: part={part}, surpriseness={surpriseness}, strategy={strategy}, output={output_folder}")
 	
 	try:
+		input_path = normalize_client_path(last_analyzed_file)
 		# Parse the MIDI file - returns list of {'pitch', 'duration', 'interval'}
-		note_data = parse_midi_file(str(last_analyzed_file))
+		note_data = parse_midi_file(str(input_path))
 		if note_data is None or len(note_data) == 0:
 			response = {"type": "error", "message": "Could not parse MIDI file"}
 			conn.sendall((json.dumps(response) + "\n").encode('utf8'))
@@ -672,7 +764,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 		notes = [n['pitch'] for n in note_data]
 		
 		# Load original MIDI file
-		mid = mido.MidiFile(str(last_analyzed_file))
+		mid = mido.MidiFile(str(input_path))
 		
 		# Find the melody track
 		melody_track = None
@@ -858,7 +950,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 		
 		# Generate output filename
 		part_names = ['beginning', 'first_half', 'third_quarter', 'end']
-		output_filename = f"{Path(last_analyzed_file).stem}_variate_part{part}_{part_names[part]}_surp{int(surpriseness)}.mid"
+		output_filename = f"{input_path.stem}_variate_part{part}_{part_names[part]}_surp{int(surpriseness)}.mid"
 		
 		# Save the modified MIDI file to the specified output folder
 		output_file = output_path / output_filename
@@ -870,7 +962,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 		response = {
 			"type": "variate_midi_file_result",
 			"status": "success",
-			"input_file": Path(last_analyzed_file).name,
+			"input_file": input_path.name,
 			"output_file": output_filename,
 			"output_folder": str(output_path),
 			"part": part,
@@ -895,12 +987,19 @@ def analyze_midi_sequence(file_path, addr, conn):
 	"""Analyze a MIDI file sequence note-by-note and calculate IC for each note."""
 	global graphidyom_service, graphidyom_model_id, last_analyzed_file
 	
+	file_path = normalize_client_path(file_path)
+	if not file_path.exists():
+		response = {"type": "error", "message": f"File not found: {file_path}"}
+		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
+		add_log(f"  [{addr[1]}] File not found: {file_path}")
+		return
+
 	# Store the file path for potential later use in generate_midi_file
-	last_analyzed_file = file_path
-	add_log(f"  [{addr[1]}] Storing analyzed file for later generation: {Path(file_path).name}")
+	last_analyzed_file = str(file_path)
+	add_log(f"  [{addr[1]}] Storing analyzed file for later generation: {file_path.name}")
 	
 	# Parse the MIDI file - returns list of {'pitch', 'duration', 'interval'}
-	note_data = parse_midi_file(file_path)
+	note_data = parse_midi_file(str(file_path))
 	if note_data is None:
 		response = {"type": "error", "message": "Could not parse MIDI file"}
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
@@ -1806,7 +1905,7 @@ def handle_add_training_file(file_path, addr, conn):
 	global pending_training_files
 	
 	# Normalize path
-	file_path = Path(file_path).resolve()
+	file_path = normalize_client_path(file_path)
 	
 	if not file_path.exists():
 		response = {
@@ -2127,7 +2226,7 @@ def export_ic_plot(addr, conn, output_folder):
 		fig.patch.set_facecolor('#0a0a14')
 		
 		# Save to specified output folder
-		output_path = Path(output_folder).resolve()
+		output_path = normalize_client_path(output_folder)
 		output_path.mkdir(parents=True, exist_ok=True)
 		filename = "IC-evolution.png"
 		filepath = output_path / filename
@@ -2413,18 +2512,19 @@ def handle_parameter_change(cmd, addr, conn):
 					add_log(f"  [{addr[1]}] DEBUG: No sampling_strategies in cmd")
 				
 				# Determine if file_arg is a file path or folder path
-				file_arg_path = Path(file_arg)
+				file_arg_path = normalize_client_path(file_arg)
 				user_provided_filename = None
+				file_arg_suffix = file_arg_path.suffix.lower()
 				
-				if file_arg_path.is_dir() or (not file_arg.endswith(('.mid', '.midi')) and output_folder is None):
+				if file_arg_path.is_dir() or (file_arg_suffix not in ['.mid', '.midi'] and output_folder is None):
 					# It's a folder - use last analyzed file and save to this folder
 					if last_analyzed_file is None:
 						raise ValueError("No file analyzed yet. Please run analyse_and_generate first.")
-					output_folder = file_arg
+					output_folder = str(file_arg_path)
 					input_file = last_analyzed_file
 				else:
 					# It's a file path from savedialog
-					if file_arg.endswith(('.mid', '.midi')):
+					if file_arg_suffix in ['.mid', '.midi']:
 						# Full file path provided by savedialog
 						output_folder = str(file_arg_path.parent)
 						user_provided_filename = file_arg_path.name  # Extract the filename
@@ -2434,7 +2534,7 @@ def handle_parameter_change(cmd, addr, conn):
 							raise ValueError("No file analyzed yet. Please run analyse_and_generate first.")
 					else:
 						# Just a folder path
-						output_folder = file_arg
+						output_folder = str(file_arg_path)
 						input_file = last_analyzed_file
 						if input_file is None:
 							raise ValueError("No file analyzed yet. Please run analyse_and_generate first.")

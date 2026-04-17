@@ -18,6 +18,13 @@ if (!inNode) {
 	// no further action
 } else {
 	var net = require('net');
+	var path = require('path');
+	var fileURLToPath = null;
+	try {
+		fileURLToPath = require('url').fileURLToPath;
+	} catch (e) {
+		// Older Max Node runtimes may not expose fileURLToPath.
+	}
 	var maxApi = null;
 	try {
 		maxApi = require('max-api');
@@ -103,6 +110,115 @@ if (!inNode) {
 		} else {
 			error('Cannot send parameter: not connected');
 		}
+	}
+
+	function flattenArgs(args) {
+		var flattened = [];
+		function add(value) {
+			if (Array.isArray(value)) {
+				for (var i = 0; i < value.length; i++) add(value[i]);
+			} else if (value !== undefined && value !== null) {
+				flattened.push(String(value));
+			}
+		}
+		for (var i = 0; i < args.length; i++) add(args[i]);
+		return flattened;
+	}
+
+	function stripWrappingQuotes(text) {
+		text = String(text || '').trim();
+		while (text.length >= 2) {
+			var first = text.charAt(0);
+			var last = text.charAt(text.length - 1);
+			if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+				text = text.slice(1, -1).trim();
+			} else {
+				break;
+			}
+		}
+		return text;
+	}
+
+	function normalizePathText(text) {
+		var raw = stripWrappingQuotes(text);
+		if (!raw) return raw;
+
+		if (/^file:\/\//i.test(raw)) {
+			try {
+				if (fileURLToPath) {
+					raw = fileURLToPath(raw);
+				} else {
+					raw = decodeURIComponent(raw.replace(/^file:\/\/localhost/i, '').replace(/^file:\/\//i, ''));
+				}
+			} catch (e) {
+				raw = raw.replace(/^file:\/\/localhost/i, '').replace(/^file:\/\//i, '');
+				try {
+					raw = decodeURIComponent(raw);
+				} catch (decodeError) {}
+			}
+		} else if (/%[0-9A-Fa-f]{2}/.test(raw)) {
+			try {
+				raw = decodeURIComponent(raw);
+			} catch (e) {}
+		}
+
+		raw = raw.replace(/\\ /g, ' ');
+		return path.normalize(raw);
+	}
+
+	function normalizePathArgs(args) {
+		return normalizePathText(flattenArgs(args).join(' '));
+	}
+
+	function isStrategyAtom(value) {
+		return /^[0-2]$/.test(String(value).trim());
+	}
+
+	function parseStrategyText(value) {
+		var values = String(value || '').replace(/,/g, ' ').trim().split(/\s+/).filter(Boolean);
+		if (values.length !== 8 && values.length !== 9) return null;
+		for (var i = 0; i < values.length; i++) {
+			if (!isStrategyAtom(values[i])) return null;
+		}
+		return values;
+	}
+
+	function splitPathAndStrategies(args) {
+		var parts = flattenArgs(args);
+		var strategies = [];
+		if (parts.length > 1) {
+			var parsedTextStrategies = parseStrategyText(parts[parts.length - 1]);
+			if (parsedTextStrategies) {
+				parts.pop();
+				return {
+					path: normalizePathArgs(parts),
+					strategies: parsedTextStrategies
+				};
+			}
+		}
+		while (parts.length > 0 && isStrategyAtom(parts[parts.length - 1])) {
+			strategies.unshift(parts.pop());
+		}
+		if (strategies.length !== 8 && strategies.length !== 9) {
+			parts = parts.concat(strategies);
+			strategies = [];
+		}
+		return {
+			path: normalizePathArgs(parts),
+			strategies: strategies
+		};
+	}
+
+	function splitPathAndTrailingArgs(args, trailingCount) {
+		var parts = flattenArgs(args);
+		var trailing = [];
+		while (trailing.length < trailingCount && parts.length > 0) {
+			trailing.unshift(parts.pop());
+		}
+		return {
+			path: normalizePathArgs(parts),
+			trailing: trailing
+		};
 	}
 
 	function createAndConnect() {
@@ -371,11 +487,12 @@ if (!inNode) {
 		// MIDI File Training Handlers
 		// =============================================
 		
-		maxApi.addHandler('add_training_file', function(filePath) {
+		maxApi.addHandler('add_training_file', function() {
 			// Add a MIDI file path to the training queue
 			// Accepts full path to .mid/.midi file
+			var filePath = normalizePathArgs(arguments);
 			poster('add_training_file called with: ' + filePath);
-			sendParameter({add_training_file: String(filePath)});
+			sendParameter({add_training_file: filePath});
 		});
 		
 		maxApi.addHandler('clear_training_files', function() {
@@ -432,20 +549,24 @@ if (!inNode) {
 			sendParameter({load_model_by_name: String(modelName)});
 		});
 		
-		maxApi.addHandler('analyse_and_generate', function(filePath) {
+		maxApi.addHandler('analyse_and_generate', function() {
 			// Analyze a MIDI file note-by-note and generate IC for each note
+			var filePath = normalizePathArgs(arguments);
 			poster('analyse_and_generate called with: ' + filePath);
-			sendParameter({analyse_and_generate: String(filePath)});
+			sendParameter({analyse_and_generate: filePath});
 		});
 		
-		maxApi.addHandler('generate_midi_file', function(outputFolder, ...strategies) {
+		maxApi.addHandler('generate_midi_file', function() {
 			// Generate next note(s) and save extended MIDI file
 			// Receives: path int1 int2 int3 int4 int5 int6 int7 int8 int9
 			// Optional: strategies as space-separated integers for 8-note generation
+			var parsed = splitPathAndStrategies(arguments);
+			var outputFolder = parsed.path;
+			var strategies = parsed.strategies;
 			poster('generate_midi_file handler called with path: ' + outputFolder);
 			poster('  extra args: ' + JSON.stringify(strategies));
 			
-			let params = {generate_midi_file: String(outputFolder)};
+			let params = {generate_midi_file: outputFolder};
 			if (strategies && strategies.length > 0) {
 				let strategiesStr = strategies.map(s => String(s)).join(' ');
 				params.sampling_strategies = strategiesStr;
@@ -454,19 +575,23 @@ if (!inNode) {
 			sendParameter(params);
 		});
 		
-		maxApi.addHandler('variate_midi_file', function(outputFolder, part, surpriseness) {
+		maxApi.addHandler('variate_midi_file', function() {
 			// Variate: modify notes in a specific part of the MIDI file
 			// Receives: outputFolder part surpriseness
 			// Example: "C:/path/to/folder" 0 37
 			// part: which quarter of the file (0=beginning, 1=first_half, 2=third_quarter, 3=end)
 			// surpriseness: 0-42=most probable, 43-84=average, 85-127=least probable
+			var parsed = splitPathAndTrailingArgs(arguments, 2);
+			var outputFolder = parsed.path;
+			var part = parsed.trailing[0];
+			var surpriseness = parsed.trailing[1];
 			poster('variate_midi_file handler called');
 			poster('  outputFolder: ' + outputFolder + ' (type: ' + typeof outputFolder + ')');
 			poster('  part: ' + part + ' (type: ' + typeof part + ')');
 			poster('  surpriseness: ' + surpriseness + ' (type: ' + typeof surpriseness + ')');
 			
 			let params = {
-				variate_midi_file: String(outputFolder),
+				variate_midi_file: outputFolder,
 				part: String(part),
 				surpriseness: String(surpriseness)
 			};
@@ -488,13 +613,13 @@ if (!inNode) {
 					}
 					
 					if (args.length > 0) {
-						// First arg is the path
-						let params = {generate_midi_file: String(args[0])};
-						poster('*** ANYTHING: using args[0] as path: ' + args[0]);
+						let parsed = splitPathAndStrategies(args);
+						let params = {generate_midi_file: parsed.path};
+						poster('*** ANYTHING: using normalized path: ' + parsed.path);
 						
 						// Remaining args are strategies
-						if (args.length > 1) {
-							let strategies = args.slice(1);
+						if (parsed.strategies.length > 0) {
+							let strategies = parsed.strategies;
 							poster('*** ANYTHING: strategies array: ' + JSON.stringify(strategies));
 							let strategiesStr = strategies.map(s => String(s)).join(' ');
 							params.sampling_strategies = strategiesStr;
@@ -508,9 +633,10 @@ if (!inNode) {
 					poster('*** ANYTHING: args length: ' + args.length);
 					
 					if (args.length >= 3) {
-						let outputFolder = String(args[0]);
-						let part = parseInt(args[1]);
-						let surpriseness = parseInt(args[2]);
+						let parsed = splitPathAndTrailingArgs(args, 2);
+						let outputFolder = parsed.path;
+						let part = parseInt(parsed.trailing[0]);
+						let surpriseness = parseInt(parsed.trailing[1]);
 						let params = {variate_midi_file: outputFolder, part: String(part), surpriseness: String(surpriseness)};
 						sendParameter(params);
 						poster('*** ANYTHING: sent variate - folder=' + outputFolder + ', part=' + part + ', surpriseness=' + surpriseness);
@@ -527,12 +653,13 @@ if (!inNode) {
 		// Handle list messages from [prepend export_path] in Max
 		// Debug: catch export_path selector directly
 		try {
-			maxApi.addHandler('export_path', function(folderPath) {
+			maxApi.addHandler('export_path', function() {
+				var folderPath = normalizePathArgs(arguments);
 				poster('*** EXPORT_PATH HANDLER TRIGGERED ***');
 				poster('  folderPath type: ' + typeof folderPath);
 				poster('  folderPath value: ' + folderPath);
 				if (folderPath) {
-					sendParameter({export_plot: String(folderPath)});
+					sendParameter({export_plot: folderPath});
 				}
 			});
 			poster('✓ export_path handler registered');
@@ -545,8 +672,9 @@ if (!inNode) {
 			maxApi.addHandler('anything', function(selector, ...rest) {
 				poster('*** ANYTHING HANDLER: selector=' + selector + ', rest=' + JSON.stringify(rest));
 				if (selector === 'export_path' && rest.length > 0) {
-					poster('*** EXPORT via anything: ' + rest[0]);
-					sendParameter({export_plot: String(rest[0])});
+					var folderPath = normalizePathArgs(rest);
+					poster('*** EXPORT via anything: ' + folderPath);
+					sendParameter({export_plot: folderPath});
 				}
 			});
 			poster('✓ anything handler registered');
@@ -559,4 +687,3 @@ if (!inNode) {
 		maxApi.outlet('ready', 1);
 	}
 }
-

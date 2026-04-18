@@ -1508,8 +1508,11 @@ def handle_client(conn, addr):
 	# Buffer for incoming messages
 	recv_buffer = ""
 	
-	# Last time we generated a note (for generate mode timing)
-	last_generation_time = time.time()
+	# Absolute sequencer clock. Scheduling from the ideal next event time
+	# prevents small sleep/prediction delays from accumulating as tempo drift.
+	scheduled_interval_seconds = get_note_interval_seconds()
+	next_generation_time = time.perf_counter() + scheduled_interval_seconds
+	was_generating = generation_params['mode'] == 'generate'
 	
 	try:
 		while server_running:
@@ -1587,17 +1590,29 @@ def handle_client(conn, addr):
 				print(f"⚠ Error receiving command: {e}")
 			
 			# Only auto-generate in 'generate' mode
+			interval_seconds = get_note_interval_seconds()
+			now = time.perf_counter()
 			if generation_params['mode'] != 'generate':
+				was_generating = False
+				scheduled_interval_seconds = interval_seconds
+				next_generation_time = now + interval_seconds
 				time.sleep(0.01)  # Small sleep to avoid busy loop in interact/train modes
 				continue
 			
-			# Check if enough time has passed for next note
-			interval_seconds = get_note_interval_seconds()
-			if time.time() - last_generation_time < interval_seconds:
-				time.sleep(0.001)  # Small sleep to avoid busy loop
+			if (not was_generating) or abs(interval_seconds - scheduled_interval_seconds) > 1e-9:
+				scheduled_interval_seconds = interval_seconds
+				next_generation_time = now + interval_seconds
+				was_generating = True
+			
+			if now < next_generation_time:
+				time.sleep(min(0.001, next_generation_time - now))  # Small sleep to avoid busy loop
 				continue
 			
-			last_generation_time = time.time()
+			if interval_seconds > 0 and now - next_generation_time >= interval_seconds:
+				missed_slots = int((now - next_generation_time) // interval_seconds)
+				next_generation_time += missed_slots * interval_seconds
+			
+			next_generation_time += interval_seconds
 			
 			# Get prediction from GraphIDYOM based on current history
 			try:
@@ -1674,6 +1689,11 @@ def handle_client(conn, addr):
 			msg_on = {"type": "midi", "cmd": "note_on", "note": note, "vel": 100, "duration": duration_seconds}
 			if not safe_send(msg_on):
 				break  # Connection closed, exit loop
+			
+			now = time.perf_counter()
+			if interval_seconds > 0 and now >= next_generation_time:
+				missed_slots = int((now - next_generation_time) // interval_seconds) + 1
+				next_generation_time += missed_slots * interval_seconds
 			
 	except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
 		add_log(f"{warning(f'Client {addr} disconnected: {type(e).__name__}')}")

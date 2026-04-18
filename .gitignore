@@ -1,0 +1,7 @@
+# Local benchmark scripts and generated latency outputs
+tools/
+results/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]

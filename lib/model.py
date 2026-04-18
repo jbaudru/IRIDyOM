@@ -52,8 +52,6 @@ from merge import (
     EntropyGeometricMerge,
     EntropyArithmeticMerge,
     PPMMerge,
-    EtaPPMMerge,
-    eta_expansion_dists,
     entropy_weights,
 )
 from graph_types import Dist, MidiParser, NoteInfo, ProcessedSequence, StepPrediction, Symbol, TokenCodec
@@ -93,7 +91,7 @@ class _STMState:
     def __init__(self, *, orders: Sequence[int]):
         self.graphs: Dict[int, nx.DiGraph] = {int(o): nx.DiGraph() for o in orders}
         for g in self.graphs.values():
-            g.graph["_phat_cache_version"] = 0
+            g.graph["_graph_cache_version"] = 0
         self.orders: Tuple[int, ...] = tuple(int(o) for o in orders)
         self.per_order: Dict[int, _STMOrderState] = {
             int(o): _STMOrderState(order=int(o), window=[]) for o in orders
@@ -140,10 +138,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
         ppm_stm_exclusion: bool = True,
         ppm_ltm_update_exclusion: bool = False,
         ppm_stm_update_exclusion: bool = True,
-        # Eta-based P_hat expansion parameters
-        eta_ltm: float = 0.0,
-        eta_stm: Optional[float] = None,
-        eta_max_depth: int = 15,
         verbosity: int = 1,
         # Target viewpoint for projection
         target_viewpoint: Optional[str] = None,
@@ -178,9 +172,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
         self.ppm_stm_exclusion = bool(ppm_stm_exclusion)
         self.ppm_ltm_update_exclusion = bool(ppm_ltm_update_exclusion)
         self.ppm_stm_update_exclusion = bool(ppm_stm_update_exclusion)
-        self.eta_ltm = max(0.0, min(float(eta_ltm), 0.999999))
-        self.eta_stm = max(0.0, min(float(self.eta_ltm if eta_stm is None else eta_stm), 0.999999))
-        self.eta_max_depth = max(1, int(eta_max_depth))
         self.verbosity = int(verbosity)
 
         # Merging strategies
@@ -209,7 +200,7 @@ class GraphIDYOMModel(TargetProjectionMixin):
             self.ppm.reset_escape_on_unseen = self.ppm_reset_escape_on_unseen
         if hasattr(self.ppm, 'exclusion'):
             self.ppm.exclusion = self.ppm_ltm_exclusion
-        if isinstance(self.order_merge, (PPMMerge, EtaPPMMerge)):
+        if isinstance(self.order_merge, PPMMerge):
             self.ppm = self.order_merge
         self.ppm_reset_escape_on_unseen = bool(
             getattr(self.ppm, "reset_escape_on_unseen", self.ppm_reset_escape_on_unseen)
@@ -239,13 +230,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
         self._stm_state: Optional[_STMState] = None
         if self.use_stm:
             self.reset_stm()
-
-    def _eta_for_graphs(self, graphs: Mapping[int, nx.DiGraph]) -> float:
-        if graphs is self.ltm_graphs:
-            return float(self.eta_ltm)
-        if self._stm_state is not None and graphs is self._stm_state.graphs:
-            return float(self.eta_stm)
-        return float(self.eta_ltm)
 
     def _ppm_exclusion_for_graphs(self, graphs: Mapping[int, nx.DiGraph]) -> bool:
         if graphs is self.ltm_graphs:
@@ -648,9 +632,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
             "ppm_stm_exclusion": self.ppm_stm_exclusion,
             "ppm_ltm_update_exclusion": self.ppm_ltm_update_exclusion,
             "ppm_stm_update_exclusion": self.ppm_stm_update_exclusion,
-            "eta_ltm": float(self.eta_ltm),
-            "eta_stm": float(self.eta_stm),
-            "eta_max_depth": int(self.eta_max_depth),
             "viewpoint_config": viewpoint_config_dict,
         }
         if self.viewpoint_spec is not None:
@@ -770,12 +751,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
                 object.__setattr__(self.ppm, "exclusion", self.ppm_ltm_exclusion)  # type: ignore[arg-type]
             except Exception:
                 pass
-        if "eta_ltm" in metadata:
-            self.eta_ltm = max(0.0, min(float(metadata.get("eta_ltm", self.eta_ltm)), 0.999999))
-        if "eta_stm" in metadata:
-            self.eta_stm = max(0.0, min(float(metadata.get("eta_stm", self.eta_stm)), 0.999999))
-        if "eta_max_depth" in metadata:
-            self.eta_max_depth = max(1, int(metadata.get("eta_max_depth", self.eta_max_depth)))
         
         # Validate viewpoint configuration
         saved_vp_config = metadata.get("viewpoint_config")
@@ -1145,9 +1120,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
         if self.use_ppm:
             # Collect counts for each order in high->low order.
             counts_by_order: List[Tuple[int, Mapping[Symbol, float]]] = []
-            context_states: Dict[int, Optional[str]] = {}
-            eta_for_graphs = float(self._eta_for_graphs(graphs))
-            use_eta_trace = isinstance(self.ppm, EtaPPMMerge) and eta_for_graphs > 0.0
             use_update_exclusion = bool(self._ppm_update_exclusion_for_graphs(graphs))
 
             # Track PPM escape allocation to produce coherent "weights".
@@ -1156,7 +1128,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
             for k in sorted(self.orders, reverse=True):
                 ctx = self._context_node_label(history, k)
-                context_states[k] = ctx
                 if ctx is None:
                     continue
                 gk = graphs.get(k)
@@ -1182,18 +1153,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
                 if total > 0.0:
                     # Conditional dist for entropy diagnostics
                     dk = normalize_counts(dict(ck))
-                    if use_eta_trace and int(k) > 0:
-                        dk_eta = eta_expansion_dists(
-                            [dk],
-                            orders=[int(k)],
-                            graphs=graphs,
-                            context_states=context_states,
-                            eta=eta_for_graphs,
-                            max_depth=self.eta_max_depth,
-                            codec=self.codec,
-                        )
-                        if dk_eta and dk_eta[0]:
-                            dk = dict(dk_eta[0])
                     ot.dist = dict(dk) if (cfg.store_per_order_dists and dk) else None
                     ot.entropy = float(dist_entropy_bits(dk)) if dk else None
                     ot.rel_entropy = float(dist_relative_entropy(dk)) if dk else None
@@ -1295,36 +1254,14 @@ class GraphIDYOMModel(TargetProjectionMixin):
                 c for order, c in sorted(counts_by_order, key=lambda x: -x[0]) if order != 0
             ]
             counts_list.append(c0)
-            
-            # Build orders list for perception PPM
-            orders_high_to_low: List[int] = [
-                order for order, c in sorted(counts_by_order, key=lambda x: -x[0]) if order != 0
-            ]
-            orders_high_to_low.append(0)
 
-            # Use eta-expanded PPM if configured
-            if isinstance(self.ppm, EtaPPMMerge):
-                dist = self.ppm.dist_from_counts(
-                    counts_list,
-                    alphabet=self.alphabet or None,
-                    excluded_count=self.ppm_excluded_count,
-                    exclusion=self._ppm_exclusion_for_graphs(graphs),
-                    update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
-                    graphs=graphs,
-                    context_states=context_states,
-                    orders_high_to_low=orders_high_to_low,
-                    codec=self.codec,
-                    eta_override=self._eta_for_graphs(graphs),
-                    max_depth_override=self.eta_max_depth,
-                )
-            else:
-                dist = self.ppm.dist_from_counts(
-                    counts_list,
-                    alphabet=self.alphabet or None,
-                    excluded_count=self.ppm_excluded_count,
-                    exclusion=self._ppm_exclusion_for_graphs(graphs),
-                    update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
-                )
+            dist = self.ppm.dist_from_counts(
+                counts_list,
+                alphabet=self.alphabet or None,
+                excluded_count=self.ppm_excluded_count,
+                exclusion=self._ppm_exclusion_for_graphs(graphs),
+                update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
+            )
             
             # Project distribution to target viewpoint if specified
             if self.target_viewpoint is not None:
@@ -1353,11 +1290,9 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
         # --- Entropy-weighted order merge path ---
         per_order_dists: List[Tuple[int, Dist]] = []
-        context_states: Dict[int, Optional[str]] = {}
 
         for k in self.orders:
             ctx = self._context_node_label(history, k)
-            context_states[k] = ctx
             if ctx is None:
                 continue
             gk = graphs.get(k)
@@ -1379,36 +1314,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
         orders_with_dists = [k for k, _ in per_order_dists]
         dists_for_merge = [d for _, d in per_order_dists]
-
-        # Set context for eta-aware order merges
-        if hasattr(self.order_merge, "set_context"):
-            try:
-                self.order_merge.set_context(graphs, context_states, orders_with_dists, codec=self.codec)
-            except TypeError:
-                self.order_merge.set_context(graphs, context_states, orders_with_dists)
-        if hasattr(self.order_merge, "set_eta"):
-            try:
-                self.order_merge.set_eta(eta=self._eta_for_graphs(graphs), max_depth=self.eta_max_depth)
-            except TypeError:
-                pass
-
-        # For eta-aware merges we materialize expanded dists here so trace values
-        # match the effective distributions used by the merge.
-        if hasattr(self.order_merge, "prepare_dists"):
-            try:
-                dists_for_merge = list(self.order_merge.prepare_dists(dists_for_merge))
-            except TypeError:
-                dists_for_merge = list(
-                    eta_expansion_dists(
-                        dists_for_merge,
-                        orders=orders_with_dists,
-                        graphs=graphs,
-                        context_states=context_states,
-                        eta=self._eta_for_graphs(graphs),
-                        max_depth=self.eta_max_depth,
-                        codec=self.codec,
-                    )
-                )
 
         # Compute rel entropies and weights coherently with merge.py
         w_mode = getattr(self.order_merge, "weight_mode", "inverse_power")
@@ -1475,13 +1380,10 @@ class GraphIDYOMModel(TargetProjectionMixin):
         if self.use_ppm:
             # Build counts from highest order to lowest order, then include order-0 counts.
             counts_list: List[Mapping[Symbol, float]] = []
-            orders_high_to_low: List[int] = []
-            context_states: Dict[int, Optional[str]] = {}
             use_update_exclusion = bool(self._ppm_update_exclusion_for_graphs(graphs))
 
             for k in sorted(self.orders, reverse=True):
                 ctx = self._context_node_label(history, k)
-                context_states[k] = ctx
                 if ctx is None:
                     continue
                 gk = graphs.get(k)
@@ -1495,7 +1397,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
                     use_update_exclusion=use_update_exclusion,
                 )
                 counts_list.append(ck)
-                orders_high_to_low.append(k)
 
             # Order 0 counts from node weights (preferred)
             c0 = order0_counts_from_graphs(
@@ -1505,31 +1406,14 @@ class GraphIDYOMModel(TargetProjectionMixin):
                 use_update_exclusion=use_update_exclusion,
             )
             counts_list.append(c0)
-            orders_high_to_low.append(0)
 
-            # Use eta-expanded PPM if configured
-            if isinstance(self.ppm, EtaPPMMerge):
-                dist = self.ppm.dist_from_counts(
-                    counts_list,
-                    alphabet=self.alphabet or None,
-                    excluded_count=self.ppm_excluded_count,
-                    exclusion=self._ppm_exclusion_for_graphs(graphs),
-                    update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
-                    graphs=graphs,
-                    context_states=context_states,
-                    orders_high_to_low=orders_high_to_low,
-                    codec=self.codec,
-                    eta_override=self._eta_for_graphs(graphs),
-                    max_depth_override=self.eta_max_depth,
-                )
-            else:
-                dist = self.ppm.dist_from_counts(
-                    counts_list,
-                    alphabet=self.alphabet or None,
-                    excluded_count=self.ppm_excluded_count,
-                    exclusion=self._ppm_exclusion_for_graphs(graphs),
-                    update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
-                )
+            dist = self.ppm.dist_from_counts(
+                counts_list,
+                alphabet=self.alphabet or None,
+                excluded_count=self.ppm_excluded_count,
+                exclusion=self._ppm_exclusion_for_graphs(graphs),
+                update_exclusion=self._ppm_update_exclusion_for_graphs(graphs),
+            )
             
             # Project distribution to target viewpoint if specified
             if self.target_viewpoint is not None:
@@ -1539,12 +1423,9 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
         # Non-PPM: compute per-order dists and merge
         per_order_dists: List[Dist] = []
-        context_states: Dict[int, Optional[str]] = {}
-        orders_with_dists: List[int] = []
 
         for k in self.orders:
             ctx = self._context_node_label(history, k)
-            context_states[k] = ctx
             if ctx is None:
                 continue
             gk = graphs.get(k)
@@ -1553,30 +1434,15 @@ class GraphIDYOMModel(TargetProjectionMixin):
             dk = dist_from_out_edges(gk, ctx, order_k=k, codec=self.codec)
             if dk:
                 per_order_dists.append(dk)
-                orders_with_dists.append(k)
 
         # Order 0
         c0 = order0_counts_from_graphs(graphs, orders=self.orders, codec=self.codec)
         d0 = normalize_counts(c0)
         if d0:
             per_order_dists.append(d0)
-            orders_with_dists.append(0)
 
         if not per_order_dists:
             return self._fallback_uniform_dist()
-
-        # Set context for eta-aware merges
-        if hasattr(self.order_merge, 'set_context'):
-            try:
-                self.order_merge.set_context(graphs, context_states, orders_with_dists, codec=self.codec)
-            except TypeError:
-                # Backward compatibility for custom merge strategies with old signature.
-                self.order_merge.set_context(graphs, context_states, orders_with_dists)
-        if hasattr(self.order_merge, "set_eta"):
-            try:
-                self.order_merge.set_eta(eta=self._eta_for_graphs(graphs), max_depth=self.eta_max_depth)
-            except TypeError:
-                pass
 
         merged = self.order_merge.merge(per_order_dists)
         
@@ -1693,7 +1559,7 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
         # STM graphs mutate online, so bump a cheap cache version after each note.
         for g in self._stm_state.graphs.values():
-            g.graph["_phat_cache_version"] = int(g.graph.get("_phat_cache_version", 0)) + 1
+            g.graph["_graph_cache_version"] = int(g.graph.get("_graph_cache_version", 0)) + 1
 
     def _add_or_update_node(
         self,

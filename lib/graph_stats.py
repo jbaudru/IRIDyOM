@@ -180,7 +180,7 @@ def order0_counts_from_graphs(
     weight_key = "weight_ux" if bool(use_update_exclusion) else "weight"
     cache_key = "_order0_counts_cache_ux" if bool(use_update_exclusion) else "_order0_counts_cache"
     cache_version_key = f"{cache_key}_version"
-    graph_version = int(g.graph.get("_phat_cache_version", 0))
+    graph_version = int(g.graph.get("_graph_cache_version", 0))
     cached = g.graph.get(cache_key)
     if isinstance(cached, dict) and int(g.graph.get(cache_version_key, -1)) == graph_version:
         return dict(cached)

@@ -187,9 +187,6 @@ class GraphIDYOMAppService:
             use_ppm=bool(metadata.get("use_ppm", False)),
             ppm_excluded_count=int(metadata.get("ppm_excluded_count", 1)),
             ppm_escape_method=str(metadata.get("ppm_escape_method", "c")),
-            eta_ltm=float(metadata.get("eta_ltm", 0.0)),
-            eta_stm=float(metadata.get("eta_stm", metadata.get("eta_ltm", 0.0))),
-            eta_max_depth=int(metadata.get("eta_max_depth", 15)),
             verbosity=0,
             target_viewpoint=_normalize_target_viewpoint(metadata.get("target_viewpoint")),
         )

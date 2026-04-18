@@ -11,9 +11,6 @@
   "ppm_stm_exclusion": true,
   "ppm_ltm_update_exclusion": false,
   "ppm_stm_update_exclusion": true,
-  "eta_ltm": 0.0,
-  "eta_stm": 0.0,
-  "eta_max_depth": 15,
   "viewpoint_config": {
     "pitch": false,
     "octave": false,

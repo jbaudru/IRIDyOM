@@ -28,13 +28,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from graph_types import Dist, MergeStrategy, Symbol
-
-if TYPE_CHECKING:
-    import networkx as nx
-    from graph_types import TokenCodec
 
 
 # -------------------------
@@ -379,11 +375,15 @@ class PPMMerge:
         *,
         alphabet: Optional[Sequence[Symbol]] = None,
         excluded_count: int = 1,
+        exclusion: bool = False,
+        update_exclusion: bool = True,
     ) -> float:
         dist = self.dist_from_counts(
             counts_by_order_high_to_low,
             alphabet=alphabet,
             excluded_count=excluded_count,
+            exclusion=exclusion,
+            update_exclusion=update_exclusion,
         )
         return float(dist.get(symbol, 0.0))
 
@@ -393,6 +393,8 @@ class PPMMerge:
         *,
         alphabet: Optional[Sequence[Symbol]] = None,
         excluded_count: int = 1,
+        exclusion: bool = False,
+        update_exclusion: bool = True,
     ) -> Dist:
         # Determine alphabet for order -1 fallback
         if alphabet is None:
@@ -407,6 +409,10 @@ class PPMMerge:
             return {}
 
         out: Dict[Symbol, float] = {s: 0.0 for s in alphabet_list}
+        use_exclusion = bool(exclusion)
+        root_counts: Mapping[Symbol, float] = (
+            counts_by_order_high_to_low[-1] if counts_by_order_high_to_low else {}
+        )
 
         escape = 1.0
         k, d, method_a = self._method_params()
@@ -471,400 +477,3 @@ class PPMMerge:
             return {s: u for s in alphabet_list}
 
         return {s: float(p) / total_p for s, p in out.items()}
-
-
-# -------------------------
-# Eta-based expansion merges
-# -------------------------
-
-_perception_module = None
-
-
-def _get_perception():
-    global _perception_module
-    if _perception_module is None:
-        try:
-            from . import perception
-            _perception_module = perception
-        except ImportError:
-            import perception
-            _perception_module = perception
-    return _perception_module
-
-
-def _clip_eta(eta: float) -> float:
-    e = float(eta)
-    if e < 0.0:
-        return 0.0
-    if e >= 1.0:
-        return 0.999999
-    return e
-
-
-def eta_expansion_dists(
-    dists: Sequence[Mapping[Symbol, float]],
-    *,
-    orders: Optional[Sequence[int]] = None,
-    graphs: Optional[Mapping[int, "nx.DiGraph"]] = None,
-    context_states: Optional[Mapping[int, Optional[str]]] = None,
-    eta: float = 0.0,
-    max_depth: int = 15,
-    codec: Optional["TokenCodec"] = None,
-) -> Tuple[Dist, ...]:
-    """Replace per-order distributions by P_hat where context is available.
-
-    This is the core eta-expansion mechanism used by both arithmetic/geometric
-    order merges and eta-aware PPM.
-    """
-    if not dists:
-        return tuple()
-
-    d_clean = [dict(d) for d in dists]
-    if not graphs or not context_states or not orders:
-        return tuple(d_clean)
-
-    eta_eff = _clip_eta(float(eta))
-    depth_eff = max(1, int(max_depth))
-    if eta_eff <= 0.0:
-        return tuple(d_clean)
-
-    perception = _get_perception()
-    out: list[Dist] = []
-    for i, dist in enumerate(d_clean):
-        if i >= len(orders):
-            out.append(dist)
-            continue
-
-        order = int(orders[i])
-        if order <= 0:
-            out.append(dist)
-            continue
-
-        state = context_states.get(order)
-        g = graphs.get(order)
-        if not state or g is None:
-            out.append(dist)
-            continue
-
-        p_hat = perception.compute_phat(
-            g,
-            state,
-            eta=eta_eff,
-            max_depth=depth_eff,
-            order_k=order,
-            codec=codec,
-        )
-        out.append(dict(p_hat) if p_hat else dist)
-
-    return tuple(out)
-
-
-class _EtaOrderMixin:
-    _graphs: Optional[Mapping[int, "nx.DiGraph"]]
-    _context_states: Optional[Mapping[int, Optional[str]]]
-    _orders: Optional[Sequence[int]]
-    _codec: Optional["TokenCodec"]
-    eta: float
-    max_depth: int
-
-    def set_context(
-        self,
-        graphs: Mapping[int, "nx.DiGraph"],
-        context_states: Mapping[int, Optional[str]],
-        orders: Sequence[int],
-        codec: Optional["TokenCodec"] = None,
-    ) -> None:
-        self._graphs = graphs
-        self._context_states = context_states
-        self._orders = orders
-        self._codec = codec
-
-    def set_eta(self, *, eta: Optional[float] = None, max_depth: Optional[int] = None) -> None:
-        if eta is not None:
-            self.eta = _clip_eta(float(eta))
-        if max_depth is not None:
-            self.max_depth = max(1, int(max_depth))
-
-    def prepare_dists(self, dists: Sequence[Dist]) -> Tuple[Dist, ...]:
-        return eta_expansion_dists(
-            dists,
-            orders=self._orders,
-            graphs=self._graphs,
-            context_states=self._context_states,
-            eta=self.eta,
-            max_depth=self.max_depth,
-            codec=self._codec,
-        )
-
-
-@dataclass
-class EtaGeometricMerge(MergeStrategy, _EtaOrderMixin):
-    """Entropy-weighted geometric merge using eta-expanded P_hat distributions."""
-
-    name: str = "eta_geometric"
-    alphabet_size: Optional[int] = None
-    weight_mode: str = "inverse_power"
-    b: float = 1.0
-    eta: float = 0.0
-    max_depth: int = 15
-    # Backward-compat (ignored KL fields; map kl_eta/max_depth when provided)
-    kl_lambda: float = 0.0
-    kl_eta: Optional[float] = None
-    kl_max_depth: Optional[int] = None
-
-    _graphs: Optional[Mapping[int, "nx.DiGraph"]] = None
-    _context_states: Optional[Mapping[int, Optional[str]]] = None
-    _orders: Optional[Sequence[int]] = None
-    _codec: Optional["TokenCodec"] = None
-
-    def __post_init__(self) -> None:
-        if self.kl_eta is not None:
-            self.eta = _clip_eta(float(self.kl_eta))
-        else:
-            self.eta = _clip_eta(float(self.eta))
-        if self.kl_max_depth is not None:
-            self.max_depth = max(1, int(self.kl_max_depth))
-        else:
-            self.max_depth = max(1, int(self.max_depth))
-
-    def merge(self, dists: Sequence[Dist], *, weights: Optional[Sequence[float]] = None) -> Dist:
-        dists = [dict(d) for d in dists if d]
-        if not dists:
-            return {}
-
-        effective = list(self.prepare_dists(dists)) if weights is None else dists
-        if weights is None:
-            ws = list(
-                entropy_weights(
-                    effective,
-                    alphabet_size=self.alphabet_size,
-                    mode=self.weight_mode,
-                    b=self.b,
-                )
-            )
-        else:
-            ws = [float(w) for w in weights]
-
-        if sum(ws) <= 0.0:
-            ws = [1.0 for _ in effective]
-
-        return weighted_geometric_mean(effective, weights=ws)
-
-
-@dataclass
-class EtaArithmeticMerge(MergeStrategy, _EtaOrderMixin):
-    """Entropy-weighted arithmetic merge using eta-expanded P_hat distributions."""
-
-    name: str = "eta_arithmetic"
-    alphabet_size: Optional[int] = None
-    weight_mode: str = "inverse_power"
-    b: float = 1.0
-    eta: float = 0.0
-    max_depth: int = 15
-    # Backward-compat (ignored KL fields; map kl_eta/max_depth when provided)
-    kl_lambda: float = 0.0
-    kl_eta: Optional[float] = None
-    kl_max_depth: Optional[int] = None
-
-    _graphs: Optional[Mapping[int, "nx.DiGraph"]] = None
-    _context_states: Optional[Mapping[int, Optional[str]]] = None
-    _orders: Optional[Sequence[int]] = None
-    _codec: Optional["TokenCodec"] = None
-
-    def __post_init__(self) -> None:
-        if self.kl_eta is not None:
-            self.eta = _clip_eta(float(self.kl_eta))
-        else:
-            self.eta = _clip_eta(float(self.eta))
-        if self.kl_max_depth is not None:
-            self.max_depth = max(1, int(self.kl_max_depth))
-        else:
-            self.max_depth = max(1, int(self.max_depth))
-
-    def merge(self, dists: Sequence[Dist], *, weights: Optional[Sequence[float]] = None) -> Dist:
-        dists = [dict(d) for d in dists if d]
-        if not dists:
-            return {}
-
-        effective = list(self.prepare_dists(dists)) if weights is None else dists
-        if weights is None:
-            ws = list(
-                entropy_weights(
-                    effective,
-                    alphabet_size=self.alphabet_size,
-                    mode=self.weight_mode,
-                    b=self.b,
-                )
-            )
-        else:
-            ws = [float(w) for w in weights]
-
-        if sum(ws) <= 0.0:
-            ws = [1.0 for _ in effective]
-
-        return weighted_arithmetic_mean(effective, weights=ws)
-
-
-@dataclass
-class EtaPPMMerge:
-    """PPM backoff where each order's distribution is replaced by P_hat."""
-
-    name: str = "eta_ppm"
-    stop_escape_threshold: float = 1e-10
-    escape_method: str = "c"
-    eta: float = 0.0
-    max_depth: int = 15
-    # Backward-compat (ignored KL fields; map kl_eta/max_depth when provided)
-    kl_lambda: float = 0.0
-    kl_eta: Optional[float] = None
-    kl_max_depth: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        if self.kl_eta is not None:
-            self.eta = _clip_eta(float(self.kl_eta))
-        else:
-            self.eta = _clip_eta(float(self.eta))
-        if self.kl_max_depth is not None:
-            self.max_depth = max(1, int(self.kl_max_depth))
-        else:
-            self.max_depth = max(1, int(self.max_depth))
-
-    def _method_params(self) -> tuple[float, float, bool]:
-        m = str(self.escape_method).strip().lower()
-        if m == "a":
-            return 0.0, 1.0, True
-        if m == "b":
-            return -1.0, 1.0, False
-        if m == "c":
-            return 0.0, 1.0, False
-        if m == "d":
-            return -0.5, 2.0, False
-        if m == "x":
-            return 0.0, 1.0, False
-        raise ValueError(f"Unknown PPM escape method: {self.escape_method!r}. Expected one of: a,b,c,d,x")
-
-    def _type_count(self, counts: Mapping[Symbol, float]) -> float:
-        m = str(self.escape_method).strip().lower()
-        if m == "x":
-            singletons = 0
-            for v in counts.values():
-                if float(v) == 1.0:
-                    singletons += 1
-            return float(singletons + 1)
-        return float(sum(1 for v in counts.values() if float(v) > 0.0))
-
-    def dist_from_counts(
-        self,
-        counts_by_order_high_to_low: Sequence[Mapping[Symbol, float]],
-        *,
-        alphabet: Optional[Sequence[Symbol]] = None,
-        excluded_count: int = 1,
-        graphs: Optional[Mapping[int, "nx.DiGraph"]] = None,
-        context_states: Optional[Mapping[int, Optional[str]]] = None,
-        orders_high_to_low: Optional[Sequence[int]] = None,
-        codec: Optional["TokenCodec"] = None,
-        eta_override: Optional[float] = None,
-        max_depth_override: Optional[int] = None,
-    ) -> Dist:
-        if alphabet is None:
-            symset = set()
-            for c in counts_by_order_high_to_low:
-                symset.update(c.keys())
-            alphabet_list = sorted(symset)
-        else:
-            alphabet_list = list(alphabet)
-
-        if not alphabet_list:
-            return {}
-
-        out: Dict[Symbol, float] = {s: 0.0 for s in alphabet_list}
-        escape = 1.0
-        k, d, method_a = self._method_params()
-
-        eta_eff = _clip_eta(self.eta if eta_override is None else float(eta_override))
-        depth_eff = max(1, int(self.max_depth if max_depth_override is None else max_depth_override))
-        perception = _get_perception()
-        use_eta = (
-            eta_eff > 0.0
-            and graphs is not None
-            and context_states is not None
-            and orders_high_to_low is not None
-        )
-
-        for i, counts in enumerate(counts_by_order_high_to_low):
-            raw_counts = {s: float(v) for s, v in counts.items() if float(v) > 0.0}
-            if not raw_counts:
-                escape = 1.0
-                continue
-
-            adj_counts: Dict[Symbol, float] = {}
-            for s, c in raw_counts.items():
-                adj = float(c + k)
-                if adj > 0.0:
-                    adj_counts[s] = adj
-
-            state_count = float(sum(adj_counts.values()))
-            if state_count <= 0.0:
-                escape = 1.0
-                continue
-
-            type_count = float(self._type_count(raw_counts))
-            if method_a:
-                denom = state_count + 1.0
-            else:
-                denom = state_count + (type_count / float(d))
-            weight = float(state_count / denom) if denom > 0.0 else 0.0
-
-            dist_order = _normalize(dict(adj_counts))
-            if use_eta and i < len(orders_high_to_low):
-                order = int(orders_high_to_low[i])
-                if order > 0:
-                    state = context_states.get(order)
-                    g = graphs.get(order)
-                    if state and g is not None:
-                        p_hat = perception.compute_phat(
-                            g,
-                            state,
-                            eta=eta_eff,
-                            max_depth=depth_eff,
-                            order_k=order,
-                            codec=codec,
-                        )
-                        if p_hat:
-                            dist_order = p_hat
-
-            for s in alphabet_list:
-                p = float(dist_order.get(s, 0.0))
-                if p <= 0.0:
-                    continue
-                out[s] += escape * (weight * p)
-
-            escape *= (1.0 - weight)
-            if escape < float(self.stop_escape_threshold):
-                break
-
-        denom = float(len(alphabet_list) + 1 - int(excluded_count))
-        if denom > 0.0 and escape > 0.0:
-            uni = escape * (1.0 / denom)
-            if use_exclusion:
-                root_symbols = {s for s, v in root_counts.items() if float(v) > 0.0}
-                for s in alphabet_list:
-                    if s in root_symbols:
-                        continue
-                    out[s] += uni
-            else:
-                for s in alphabet_list:
-                    out[s] += uni
-
-        total_p = float(sum(out.values()))
-        if total_p <= 0.0:
-            u = 1.0 / float(len(alphabet_list))
-            return {s: u for s in alphabet_list}
-
-        return {s: float(p) / total_p for s, p in out.items()}
-
-
-# Backward-compat aliases (same semantics, no KL penalty anymore).
-PerceptionGeometricMerge = EtaGeometricMerge
-PerceptionArithmeticMerge = EtaArithmeticMerge
-PerceptionPPMMerge = EtaPPMMerge

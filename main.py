@@ -16,6 +16,7 @@ import random
 import sys
 import os
 import math
+import statistics
 import signal
 from pathlib import Path
 from collections import deque
@@ -538,36 +539,124 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 	try:
 		mid = mido.MidiFile(str(input_path))
 		
-		# Find the melody track or create one if needed
-		melody_track = None
-		if len(mid.tracks) > 1:
-			# Usually track 1 is melody (track 0 is metadata)
-			melody_track = mid.tracks[1]
+		def _pick_melody_track(midi_file):
+			"""Pick the track that most likely contains the melody notes."""
+			if not midi_file.tracks:
+				return None
+			if len(midi_file.tracks) == 1:
+				return midi_file.tracks[0]
+			best_track = None
+			best_count = -1
+			for t in midi_file.tracks:
+				count = 0
+				for m in t:
+					if m.type == 'note_on' and getattr(m, 'velocity', 0) > 0:
+						count += 1
+				if count > best_count:
+					best_count = count
+					best_track = t
+			return best_track
+		
+		def _extract_note_timing(track):
+			"""Extract absolute onset/duration and a reasonable interval grid from a MIDI track."""
+			from collections import defaultdict, deque
+			abs_time = 0
+			open_notes = defaultdict(deque)  # (pitch, channel) -> deque[start_abs_time]
+			pairs = []  # list of (start_abs, end_abs, pitch, channel, velocity)
+			last_note_on_channel = 0
+			last_note_on_velocity = 100
+			
+			for msg in track:
+				abs_time += msg.time
+				if msg.type == 'note_on' and getattr(msg, 'velocity', 0) > 0:
+					channel = getattr(msg, 'channel', 0)
+					open_notes[(msg.note, channel)].append((abs_time, msg.velocity))
+					last_note_on_channel = channel
+					last_note_on_velocity = msg.velocity
+				elif msg.type == 'note_off' or (msg.type == 'note_on' and getattr(msg, 'velocity', 0) == 0):
+					channel = getattr(msg, 'channel', 0)
+					key = (msg.note, channel)
+					if open_notes[key]:
+						start_abs, start_vel = open_notes[key].popleft()
+						end_abs = abs_time
+						if end_abs > start_abs:
+							pairs.append((start_abs, end_abs, msg.note, channel, start_vel))
+			
+			pairs.sort(key=lambda x: x[0])
+			onsets = [p[0] for p in pairs]
+			durations = [p[1] - p[0] for p in pairs]
+			intervals = [onsets[i] - onsets[i - 1] for i in range(1, len(onsets))]
+			last_onset = onsets[-1] if onsets else None
+			last_end = max((p[1] for p in pairs), default=None)
+			
+			return {
+				'track_end_abs': abs_time,
+				'pairs': pairs,
+				'onsets': onsets,
+				'durations': durations,
+				'intervals': intervals,
+				'last_onset': last_onset,
+				'last_end': last_end,
+				'last_channel': last_note_on_channel,
+				'last_velocity': last_note_on_velocity,
+			}
+		
+		# Pick a melody track and remove end_of_track so we can append validly
+		melody_track = _pick_melody_track(mid)
+		if melody_track is None:
+			raise ValueError('No MIDI tracks found')
+		
+		tail_silence_ticks = 0
+		if len(melody_track) > 0 and melody_track[-1].type == 'end_of_track':
+			tail_silence_ticks = melody_track[-1].time
+			melody_track.pop()
+		
+		timing = _extract_note_timing(melody_track)
+		durations = timing['durations']
+		intervals = timing['intervals']
+		
+		# Estimate grid from the last few notes (robust to outliers)
+		window = 12
+		if durations:
+			typ_duration = int(round(statistics.median(durations[-window:])))
 		else:
-			melody_track = mid.tracks[0]
+			typ_duration = 120  # ticks fallback
 		
-		# Extract note durations from original MIDI to apply to generated notes
-		note_durations = []  # List of raw note durations (MIDI ticks)
-		note_on_stack = []  # Stack to track open note_on events for matching with note_off
-		
-		for msg in melody_track:
-			if msg.type == 'note_on' and msg.velocity > 0:
-				# Start of a note
-				note_on_stack.append({'time': msg.time})
-			elif (msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0)):
-				# End of a note
-				if note_on_stack:
-					note_start = note_on_stack.pop()
-					duration = msg.time  # Duration is the time delta of the note_off
-					note_durations.append(duration)
-		
-		# Calculate average note duration for generated notes
-		if note_durations:
-			avg_note_duration = int(sum(note_durations) / len(note_durations))
+		# Interval is inter-onset spacing; if unavailable, assume legato grid
+		if intervals:
+			typ_interval = int(round(statistics.median(intervals[-window:])))
 		else:
-			avg_note_duration = 120  # Fallback to quarter note
+			typ_interval = typ_duration
 		
-		add_log(f"  [{addr[1]}] Extracted {len(note_durations)} note timings, avg duration: {avg_note_duration} ticks")
+		# Prefer the last observed interval/duration if present (matches file's current groove)
+		last_duration = durations[-1] if durations else typ_duration
+		last_interval = intervals[-1] if intervals else typ_interval
+		
+		append_duration = int(max(1, round(last_duration)))
+		append_interval = int(max(0, round(last_interval)))
+		
+		last_onset = timing['last_onset']
+		track_end_abs = timing['track_end_abs']
+		
+		if last_onset is None:
+			# No notes found in the track; just append at the end.
+			desired_first_onset = track_end_abs
+		else:
+			desired_first_onset = max(track_end_abs, last_onset + append_interval)
+		
+		delta_to_first = max(0, desired_first_onset - track_end_abs)
+		gap_between_notes = max(0, append_interval - append_duration)
+		if append_interval < append_duration:
+			add_log(f"  [{addr[1]}] ⚠ Continue timing overlap detected (interval {append_interval} < duration {append_duration}); clamping gaps to 0")
+		
+		add_log(
+			f"  [{addr[1]}] Continue timing: duration={append_duration} ticks, interval={append_interval} ticks, "
+			f"first_delta={delta_to_first} ticks"
+		)
+		
+		# Channel/velocity defaults from last seen note_on
+		append_channel = int(timing.get('last_channel', 0) or 0)
+		append_velocity = int(timing.get('last_velocity', 100) or 100)
 		
 		# Generate notes sequentially
 		generated_notes = []
@@ -617,7 +706,7 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 					"note": next_note,
 					"prob": next_prob,
 					"strategy": strategy,
-					"duration": avg_note_duration  # Use the extracted average duration
+					"duration": append_duration  # Match the existing file's last note duration
 				})
 				
 				# Update history for next prediction
@@ -635,12 +724,20 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 				continue
 		
 		
-		# Append all generated notes to MIDI file with same duration as original notes
-		for gen_note in generated_notes:
-			# Add note_on with zero time (appended immediately)
-			melody_track.append(mido.Message('note_on', note=gen_note["note"], velocity=100, time=0))
-			# Add note_off with the extracted duration
-			melody_track.append(mido.Message('note_off', note=gen_note["note"], velocity=0, time=gen_note["duration"]))
+		# Append all generated notes to MIDI file, aligned to the existing timing grid.
+		# NOTE: MIDI message times are DELTAS. We append using the computed deltas.
+		for i, gen_note in enumerate(generated_notes):
+			note_on_delta = delta_to_first if i == 0 else gap_between_notes
+			note_off_delta = append_duration
+			melody_track.append(
+				mido.Message('note_on', note=int(gen_note["note"]), velocity=append_velocity, time=int(note_on_delta), channel=append_channel)
+			)
+			melody_track.append(
+				mido.Message('note_off', note=int(gen_note["note"]), velocity=0, time=int(note_off_delta), channel=append_channel)
+			)
+		
+		# Restore end_of_track (preserve the original trailing silence, if any)
+		melody_track.append(mido.MetaMessage('end_of_track', time=int(tail_silence_ticks)))
 		
 		# Generate output filename
 		if output_filename is None:
@@ -676,6 +773,7 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 		}
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		add_log(f"  [{addr[1]}] Generate complete! File saved to: {output_file}")
+		_auto_export_ic_plot_for_midi(addr, conn, output_file)
 		
 	except Exception as e:
 		response = {
@@ -973,6 +1071,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 			"full_path": str(output_file)
 		}
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
+		_auto_export_ic_plot_for_midi(addr, conn, output_file)
 		
 	except Exception as e:
 		response = {
@@ -2162,8 +2261,16 @@ def handle_start_training(addr, conn):
 
 
 
-def export_ic_plot(addr, conn, output_folder):
-	"""Export IC history as a PNG plot with pianoroll background using matplotlib."""
+def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
+	"""Export IC history as a PNG plot with pianoroll background using matplotlib.
+
+	Args:
+		addr: Client address
+		conn: Connection socket
+		output_folder: Folder to write the plot into
+		filename: Optional plot filename (defaults to "IC-evolution.png")
+		midi_file: Optional MIDI file path this plot should be associated with
+	"""
 	global ic_history, ic_notes_history
 	
 	if not HAS_MATPLOTLIB:
@@ -2248,8 +2355,8 @@ def export_ic_plot(addr, conn, output_folder):
 		# Save to specified output folder
 		output_path = normalize_client_path(output_folder)
 		output_path.mkdir(parents=True, exist_ok=True)
-		filename = "IC-evolution.png"
-		filepath = output_path / filename
+		plot_filename = filename or "IC-evolution.png"
+		filepath = output_path / plot_filename
 		
 		plt.savefig(str(filepath), dpi=150, bbox_inches='tight', facecolor='#0a0a14')
 		plt.close(fig)
@@ -2258,7 +2365,7 @@ def export_ic_plot(addr, conn, output_folder):
 			"type": "export_result",
 			"status": "success",
 			"message": f"Plot exported successfully",
-			"file": filename,
+			"file": plot_filename,
 			"path": str(filepath),
 			"samples": len(ic_data),
 			"max_ic": max(ic_data) if ic_data else 0,
@@ -2266,8 +2373,10 @@ def export_ic_plot(addr, conn, output_folder):
 			"avg_ic": sum(ic_data) / len(ic_data) if ic_data else 0,
 			"midi_notes": len(notes_data)
 		}
+		if midi_file:
+			response["midi_file"] = str(midi_file)
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
-		add_log(f"  [{addr[1]}] Plot exported: {filename}")
+		add_log(f"  [{addr[1]}] Plot exported: {plot_filename}")
 		add_log(f"  [{addr[1]}] Location: {filepath}")
 		
 	except Exception as e:
@@ -2276,8 +2385,30 @@ def export_ic_plot(addr, conn, output_folder):
 			"status": "error",
 			"message": f"Failed to generate plot: {str(e)}"
 		}
+		if midi_file:
+			response["midi_file"] = str(midi_file)
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		add_log(f"  [{addr[1]}] Export error: {e}")
+
+
+def _auto_export_ic_plot_for_midi(addr, conn, midi_file_path):
+	"""Export IC plot next to a MIDI file using a matching basename.
+
+	This is used by Continue/Variate exports so each exported MIDI gets its own IC PNG
+	in the same folder, without overwriting other plots.
+	"""
+	try:
+		midi_path = normalize_client_path(midi_file_path)
+		plot_filename = f"{midi_path.stem}_IC-evolution.png"
+		export_ic_plot(
+			addr,
+			conn,
+			str(midi_path.parent),
+			filename=plot_filename,
+			midi_file=str(midi_path),
+		)
+	except Exception as e:
+		add_log(f"  [{addr[1]}] ⚠ IC plot export skipped: {e}")
 
 
 def handle_parameter_change(cmd, addr, conn):

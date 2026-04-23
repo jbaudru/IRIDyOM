@@ -612,46 +612,41 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 			melody_track.pop()
 		
 		timing = _extract_note_timing(melody_track)
-		durations = timing['durations']
-		intervals = timing['intervals']
 		
-		# Estimate grid from the last few notes (robust to outliers)
-		window = 12
-		if durations:
-			typ_duration = int(round(statistics.median(durations[-window:])))
+		# Build a per-note timing template from the last N notes (N = min(8, total notes))
+		all_pairs = timing['pairs']
+		N = min(8, max(1, len(all_pairs)))
+		template_pairs = all_pairs[-N:]
+		
+		# Per-note durations from the template
+		template_durations_ticks = [int(max(1, p[1] - p[0])) for p in template_pairs]
+		
+		# Inter-onset intervals within the template
+		if N > 1:
+			template_iois = [int(max(1, template_pairs[i + 1][0] - template_pairs[i][0])) for i in range(N - 1)]
 		else:
-			typ_duration = 120  # ticks fallback
+			# Single note: use its duration as the IOI (legato / one-note pattern)
+			template_iois = [template_durations_ticks[0]]
 		
-		# Interval is inter-onset spacing; if unavailable, assume legato grid
-		if intervals:
-			typ_interval = int(round(statistics.median(intervals[-window:])))
+		# IOI from the last existing note to the first generated note
+		if timing['intervals']:
+			ioi_to_first_gen = int(max(1, timing['intervals'][-1]))
 		else:
-			typ_interval = typ_duration
-		
-		# Prefer the last observed interval/duration if present (matches file's current groove)
-		last_duration = durations[-1] if durations else typ_duration
-		last_interval = intervals[-1] if intervals else typ_interval
-		
-		append_duration = int(max(1, round(last_duration)))
-		append_interval = int(max(0, round(last_interval)))
+			ioi_to_first_gen = template_durations_ticks[-1]  # fallback: legato
 		
 		last_onset = timing['last_onset']
 		track_end_abs = timing['track_end_abs']
 		
 		if last_onset is None:
-			# No notes found in the track; just append at the end.
 			desired_first_onset = track_end_abs
 		else:
-			desired_first_onset = max(track_end_abs, last_onset + append_interval)
+			desired_first_onset = max(track_end_abs, last_onset + ioi_to_first_gen)
 		
 		delta_to_first = max(0, desired_first_onset - track_end_abs)
-		gap_between_notes = max(0, append_interval - append_duration)
-		if append_interval < append_duration:
-			add_log(f"  [{addr[1]}] ⚠ Continue timing overlap detected (interval {append_interval} < duration {append_duration}); clamping gaps to 0")
 		
 		add_log(
-			f"  [{addr[1]}] Continue timing: duration={append_duration} ticks, interval={append_interval} ticks, "
-			f"first_delta={delta_to_first} ticks"
+			f"  [{addr[1]}] Continue timing: {N}-note template, "
+			f"durations={template_durations_ticks}, iois={template_iois}, first_delta={delta_to_first} ticks"
 		)
 		
 		# Channel/velocity defaults from last seen note_on
@@ -701,12 +696,15 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 				next_note = selected["midi"]
 				next_prob = selected.get("prob", 0.0)
 				
+				# Duration for this note taken from the per-note template (cycling)
+				note_duration_ticks = template_durations_ticks[step % N]
+				
 				# Add to generated notes
 				generated_notes.append({
 					"note": next_note,
 					"prob": next_prob,
 					"strategy": strategy,
-					"duration": append_duration  # Match the existing file's last note duration
+					"duration": note_duration_ticks
 				})
 				
 				# Update history for next prediction
@@ -724,11 +722,18 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 				continue
 		
 		
-		# Append all generated notes to MIDI file, aligned to the existing timing grid.
-		# NOTE: MIDI message times are DELTAS. We append using the computed deltas.
+		# Append all generated notes using per-note timing from the template (last N notes).
+		# NOTE: MIDI message times are DELTAS.
 		for i, gen_note in enumerate(generated_notes):
-			note_on_delta = delta_to_first if i == 0 else gap_between_notes
-			note_off_delta = append_duration
+			dur_i = template_durations_ticks[i % N]
+			if i == 0:
+				note_on_delta = delta_to_first
+			else:
+				# gap = IOI of previous note - duration of previous note
+				prev_ioi = template_iois[(i - 1) % len(template_iois)]
+				prev_dur = template_durations_ticks[(i - 1) % N]
+				note_on_delta = max(0, prev_ioi - prev_dur)
+			note_off_delta = dur_i
 			melody_track.append(
 				mido.Message('note_on', note=int(gen_note["note"]), velocity=append_velocity, time=int(note_on_delta), channel=append_channel)
 			)

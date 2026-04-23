@@ -436,36 +436,6 @@ class GraphIDYOMModel(TargetProjectionMixin):
 
         return self.ltm_graphs
 
-    def fit_files(
-        self,
-        files: Sequence[Union[str, os.PathLike]],
-        *,
-        export_graphml: bool = False,
-        export_base: str = "files",
-    ) -> Dict[int, nx.DiGraph]:
-        """Train LTM graphs from an explicit list of files."""
-
-        file_paths = [str(Path(f)) for f in files]
-        if not file_paths:
-            raise ValueError("files must contain at least one path")
-
-        self.ltm_graphs = self.graph_builder.build_file_graphs(
-            file_paths,
-            orders=self.orders,
-            export_graphml=export_graphml,
-            export_base=str(export_base),
-        )
-
-        self.alphabet = alphabet_from_graphs(self.ltm_graphs, orders=self.orders, codec=self.codec)
-
-        if self.target_viewpoint is not None:
-            self.target_alphabet = self._build_target_alphabet_from_files(file_paths)
-            self._projection_cache.clear()
-        self._refresh_merge_alphabet_size()
-        self._prime_ltm_order0_cache()
-
-        return self.ltm_graphs
-
     def export_graphs(
         self,
         graphs: Mapping[int, nx.DiGraph],

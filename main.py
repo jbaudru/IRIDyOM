@@ -207,6 +207,7 @@ generation_params = {
 	'note_duration_division': NOTE_DURATION_DIVISION,  # Note value (e.g., 1/4, 1/8)
 	'note_interval_division': NOTE_INTERVAL_DIVISION,  # Note value between onsets
 	'max_history': MAX_HISTORY_LENGTH,
+	'sequencer_running': False,
 	'mode': 'generate'  # 'generate', 'interact', or 'train'
 }
 
@@ -1097,6 +1098,11 @@ def analyze_midi_sequence(file_path, addr, conn):
 		add_log(f"  [{addr[1]}] File not found: {file_path}")
 		return
 
+	with ic_history_lock:
+		ic_history.clear()
+		ic_notes_history.clear()
+	add_log(f"  [{addr[1]}] IC history cleared for new analysis")
+
 	# Store the file path for potential later use in generate_midi_file
 	last_analyzed_file = str(file_path)
 	add_log(f"  [{addr[1]}] Storing analyzed file for later generation: {file_path.name}")
@@ -1538,6 +1544,15 @@ def select_next_note_from_predictions(predictions, midi_history):
 		return max(valid_preds, key=lambda p: p.get("prob", 0.0))["midi"]
 
 
+def trim_midi_history(midi_history):
+	"""Keep MIDI history within the configured live history limit."""
+	max_history = max(1, int(generation_params.get('max_history', MAX_HISTORY_LENGTH)))
+	if len(midi_history) <= max_history:
+		return False
+	del midi_history[:-max_history]
+	return True
+
+
 def handle_client(conn, addr):
 	global server_running, graphidyom_model_id, graphidyom_service
 	add_log(f"{success(f'Client connected from {addr[0]}:{addr[1]}')}\n")
@@ -1590,6 +1605,34 @@ def handle_client(conn, addr):
 			session_model_id = None
 			return None
 
+	def reset_prediction_session_from_history():
+		"""Reset the active session STM and rebuild it from retained history."""
+		nonlocal session_id, session_model_id, midi_history
+		current_session_id = ensure_prediction_session()
+		if current_session_id is None or graphidyom_service is None:
+			return None
+		try:
+			graphidyom_service.reset_session(session_id=current_session_id)
+			if midi_history:
+				graphidyom_service.observe_in_session(session_id=current_session_id, midi_notes=midi_history)
+			return current_session_id
+		except Exception as e:
+			add_log(f"⚠ Session reset error: {e}")
+			try:
+				graphidyom_service.close_session(session_id=current_session_id)
+			except Exception:
+				pass
+			session_id = None
+			session_model_id = None
+			return ensure_prediction_session()
+
+	def enforce_history_limit_on_session():
+		"""Apply max_history to local history and session STM before prediction."""
+		trimmed = trim_midi_history(midi_history)
+		if trimmed:
+			return reset_prediction_session_from_history()
+		return ensure_prediction_session()
+
 	def safe_send(msg):
 		"""Safely send a JSON message to the client."""
 		try:
@@ -1635,8 +1678,11 @@ def handle_client(conn, addr):
 							cmd = json.loads(line)
 							# Handle user note input in interact mode
 							if 'user_note' in cmd:
-								ensure_prediction_session()
+								if generation_params['mode'] != 'interact':
+									continue
+								enforce_history_limit_on_session()
 								handle_user_note(cmd['user_note'], midi_history, session_id, addr, conn)
+								enforce_history_limit_on_session()
 								continue
 							# Handle training note input in train mode
 							elif 'train_note' in cmd:
@@ -1649,6 +1695,7 @@ def handle_client(conn, addr):
 							# Handle STM reset command
 							elif 'reset' in cmd and cmd['reset']:
 								midi_history.clear()
+								reset_prediction_session_from_history()
 								# Also clear IC history when STM is reset
 								with ic_history_lock:
 									ic_history.clear()
@@ -1695,7 +1742,7 @@ def handle_client(conn, addr):
 			# Only auto-generate in 'generate' mode
 			interval_seconds = get_note_interval_seconds()
 			now = time.perf_counter()
-			if generation_params['mode'] != 'generate':
+			if generation_params['mode'] != 'generate' or not generation_params.get('sequencer_running', True):
 				was_generating = False
 				scheduled_interval_seconds = interval_seconds
 				next_generation_time = now + interval_seconds
@@ -1719,7 +1766,7 @@ def handle_client(conn, addr):
 			
 			# Get prediction from GraphIDYOM based on current history
 			try:
-				current_session_id = ensure_prediction_session()
+				current_session_id = enforce_history_limit_on_session()
 				if current_session_id is not None:
 					result = graphidyom_service.predict_next_session(
 						session_id=current_session_id,
@@ -1784,6 +1831,7 @@ def handle_client(conn, addr):
 			midi_history.append(note)
 			if session_id is not None:
 				graphidyom_service.observe_in_session(session_id=session_id, midi_notes=[note])
+			enforce_history_limit_on_session()
 			
 			# Convert tempo-based divisions to seconds
 			duration_seconds = get_note_duration_seconds()
@@ -2492,6 +2540,12 @@ def handle_parameter_change(cmd, addr, conn):
 			val = str(cmd['use_probabilistic']).lower()
 			generation_params['use_probabilistic'] = val in ['true', '1', 'yes']
 			print(f"  [{addr[1]}] Set probabilistic: {generation_params['use_probabilistic']}")
+
+		if 'sequencer_running' in cmd:
+			val = str(cmd['sequencer_running']).lower()
+			generation_params['sequencer_running'] = val in ['true', '1', 'yes', 'on']
+			state = "running" if generation_params['sequencer_running'] else "paused"
+			print(f"  {client_info} Sequencer: {param_value(state)}")
 		
 		if 'tempo' in cmd:
 			val = float(cmd['tempo'])

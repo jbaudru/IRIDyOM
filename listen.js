@@ -232,6 +232,7 @@ if (!inNode) {
 		client.connect(PORT, HOST, function() {
 			log('=== CONNECTION ESTABLISHED ===');
 			poster('Connected to MIDI TCP server');
+			client.setTimeout(0); // Disable idle timeout after a successful connection.
 			reconnectDelay = 500; // reset backoff
 		});
 
@@ -469,6 +470,11 @@ if (!inNode) {
 		});
 		maxApi.addHandler('use_probabilistic', function(val) {
 			sendParameter({use_probabilistic: val ? true : false});
+		});
+		maxApi.addHandler('sequencer_running', function(val) {
+			var normalized = String(val).toLowerCase();
+			var running = !(normalized === '0' || normalized === 'false' || normalized === 'off');
+			sendParameter({sequencer_running: running});
 		});
 		maxApi.addHandler('max_history', function(val) {
 			sendParameter({max_history: parseInt(val)});

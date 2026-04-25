@@ -102,7 +102,6 @@ def ascii_art_title():
  \___/\_| \_|\___/|___/  \__, |\___/\_|  |_/
                           __/ |             
                          |___/              
-Lluc Bono Rossello & Julien Baudru - 2026
 {Colors.END}"""
 	return title
 

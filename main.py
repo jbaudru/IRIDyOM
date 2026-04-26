@@ -175,7 +175,7 @@ PORT = 5005
 
 # GraphIDYOM configuration
 DATASET_NAME = 'bach'  # The trained Bach chorales model (default)
-MODEL_FOLDER = 'order_5_augmented_true'  # The model folder within the dataset (order 5 with augmentation)
+MODEL_FOLDER = 'midi_augmented_true'  # Existing trained MIDI model folder within the dataset
 MAX_HISTORY_LENGTH = 20  # Keep last N notes in history
 USE_PROBABILISTIC_SELECTION = True  # If True, sample from distribution; if False, use argmax
 TEMPERATURE = 1.0  # Higher = more random, lower = more deterministic (only for probabilistic)

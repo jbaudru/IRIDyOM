@@ -54,13 +54,20 @@ if (!inNode) {
 	var latestSequencerPhase = null;
 	
 	// Queue for pending notes to prevent duplicates and ensure strict sequencing
-	var pendingNoteQueue = [];  // Array of {pitch, vel, durationMs}
+	var pendingNoteQueue = [];  // Array of {pitch, vel, durationMs, selectedNoteIc}
 	var scheduledNoteTimer = null;  // Tracks the setTimeout for the next pending note
 
 	if (isAbletonLive) {
 		log('=== Running in Ableton Live (no max-api) ===');
 	} else {
 		log('=== Running in Max (max-api available) ===');
+	}
+
+	function outputSequencerNote(pitch, vel, durationMs, selectedNoteIc) {
+		maxApi.outlet('sequencer_note', pitch, vel, durationMs);
+		if (selectedNoteIc !== null && selectedNoteIc !== undefined && isFinite(selectedNoteIc)) {
+			maxApi.outlet('sequencer_note_ic', selectedNoteIc);
+		}
 	}
 
 	// Function to process the next pending note
@@ -85,11 +92,13 @@ if (!inNode) {
 		var pitch = nextNote.pitch;
 		var vel = nextNote.vel;
 		var durationMs = nextNote.durationMs;
+		var selectedNoteIc = nextNote.selectedNoteIc;
 		
 		currentlyPlayingNote = pitch;
 		currentNoteEndTime = now + durationMs;
-		maxApi.outlet(pitch, vel, durationMs);
-		poster('Sent queued note: pitch=' + pitch + ', vel=' + vel + ', duration=' + durationMs + 'ms');
+		outputSequencerNote(pitch, vel, durationMs, selectedNoteIc);
+		var queuedIcStr = (selectedNoteIc !== null && selectedNoteIc !== undefined) ? ', IC=' + selectedNoteIc.toFixed(3) + ' bits' : '';
+		poster('Sent queued sequencer note: pitch=' + pitch + ', vel=' + vel + ', duration=' + durationMs + 'ms' + queuedIcStr);
 		
 		// Schedule next note if queue not empty
 		if (pendingNoteQueue.length > 0) {
@@ -300,13 +309,15 @@ if (!inNode) {
 							var pitch = Math.floor(msg.note);
 							var vel = msg.vel ? Math.max(0, Math.min(127, Math.floor(msg.vel))) : 100;
 							var durationMs = msg.duration ? Math.max(1, Math.round(msg.duration * 1000)) : 500;
+							var selectedNoteIc = parseFiniteNumber(msg.selected_note_ic);
+							if (selectedNoteIc === null) selectedNoteIc = parseFiniteNumber(msg.ic);
 							
 							var now = Date.now();
 							var timeUntilNoteCanStart = currentNoteEndTime - now;
 							
 							// If current note still playing, queue this note
 							if (timeUntilNoteCanStart > 0) {
-								pendingNoteQueue.push({pitch: pitch, vel: vel, durationMs: durationMs});
+								pendingNoteQueue.push({pitch: pitch, vel: vel, durationMs: durationMs, selectedNoteIc: selectedNoteIc});
 								poster('Queued note (current ends in ' + Math.round(timeUntilNoteCanStart) + 'ms): pitch=' + pitch);
 								
 								// Schedule processing if not already scheduled
@@ -318,8 +329,9 @@ if (!inNode) {
 								// Safe to send immediately
 								currentlyPlayingNote = pitch;
 								currentNoteEndTime = now + durationMs;
-								maxApi.outlet(pitch, vel, durationMs);
-								poster('Note on: pitch=' + pitch + ', vel=' + vel + ', duration=' + durationMs + 'ms');
+								outputSequencerNote(pitch, vel, durationMs, selectedNoteIc);
+								var noteIcStr = selectedNoteIc !== null ? ', IC=' + selectedNoteIc.toFixed(3) + ' bits' : '';
+								poster('Sequencer note on: pitch=' + pitch + ', vel=' + vel + ', duration=' + durationMs + 'ms' + noteIcStr);
 							}
 						} else if (msg.type === 'midi' && msg.cmd === 'note_off') {
 							// Note_off messages: just log them (duration is managed by durationMs)
@@ -362,10 +374,12 @@ if (!inNode) {
 						}
 						maxApi.outlet(...predArray);
 						
-						var userIC = msg.user_note_ic !== undefined ? msg.user_note_ic : null;
-						var userProb = msg.user_note_prob !== undefined ? msg.user_note_prob : null;
-						var icStr = userIC !== null ? ' (IC: ' + userIC.toFixed(3) + ' bits, prob: ' + (userProb * 100).toFixed(1) + '%)' : '';
-						poster('Predictions for note ' + msg.user_note + icStr + ': ' + JSON.stringify(preds));
+						var eventNote = msg.user_note !== undefined ? msg.user_note : msg.selected_note;
+						var eventIC = msg.user_note_ic !== undefined ? msg.user_note_ic : msg.selected_note_ic;
+						var eventProb = msg.user_note_prob !== undefined ? msg.user_note_prob : msg.selected_note_prob;
+						var eventLabel = msg.user_note !== undefined ? 'note ' : 'sequencer note ';
+						var icStr = eventIC !== undefined && eventIC !== null ? ' (IC: ' + eventIC.toFixed(3) + ' bits, prob: ' + (eventProb * 100).toFixed(1) + '%)' : '';
+						poster('Predictions for ' + eventLabel + eventNote + icStr + ': ' + JSON.stringify(preds));
 						} else if (msg.type === 'train_ack') {
 							// Training note acknowledgment
 							maxApi.outlet('train_ack', msg.note, msg.sequence_length);

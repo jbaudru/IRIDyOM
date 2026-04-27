@@ -1937,6 +1937,21 @@ def select_next_note_from_predictions(predictions, midi_history):
 		return max(valid_preds, key=lambda p: p.get("prob", 0.0))["midi"]
 
 
+def find_prediction_probability(predictions, note):
+	"""Return the model probability for a selected MIDI note."""
+	for prediction in predictions or []:
+		if prediction.get("midi") == note:
+			return max(0.0, float(prediction.get("prob", 0.0) or 0.0))
+	return None
+
+
+def information_content_from_probability(probability):
+	"""Convert a probability into information content in bits."""
+	if probability is None or probability <= 0:
+		return None
+	return -math.log2(probability)
+
+
 def trim_midi_history(midi_history):
 	"""Keep MIDI history within the configured live history limit."""
 	max_history = max(1, int(generation_params.get('max_history', MAX_HISTORY_LENGTH)))
@@ -2181,6 +2196,8 @@ def handle_client(conn, addr):
 			next_generation_time += interval_seconds
 			
 			# Get prediction from GraphIDYOM based on current history
+			selected_note_prob = None
+			selected_note_ic = None
 			try:
 				current_session_id = enforce_history_limit_on_session()
 				if current_session_id is not None:
@@ -2203,6 +2220,8 @@ def handle_client(conn, addr):
 				
 				# Select next note from predictions
 				note = select_next_note_from_predictions(predictions, midi_history)
+				selected_note_prob = find_prediction_probability(predictions, note)
+				selected_note_ic = information_content_from_probability(selected_note_prob)
 				
 				# Filter predictions by MIDI range for top 3 display
 				min_note = min(generation_params['min_midi'], generation_params['max_midi'])
@@ -2221,6 +2240,9 @@ def handle_client(conn, addr):
 				# Send top 3 predictions to Max
 				predictions_msg = {
 					"type": "predictions",
+					"selected_note": note,
+					"selected_note_prob": selected_note_prob,
+					"selected_note_ic": selected_note_ic,
 					"predictions": [
 						{"note": p["midi"], "prob": p.get("prob", 0.0)} 
 						for p in top_3
@@ -2254,9 +2276,26 @@ def handle_client(conn, addr):
 			duration_seconds = _sequencer_note_duration_seconds(interval_seconds)
 			
 			# Send note_on with duration (makenote will handle note_off)
-			msg_on = {"type": "midi", "cmd": "note_on", "note": note, "vel": 100, "duration": duration_seconds}
+			msg_on = {
+				"type": "midi",
+				"cmd": "note_on",
+				"note": note,
+				"vel": 100,
+				"duration": duration_seconds,
+				"selected_note_prob": selected_note_prob,
+				"selected_note_ic": selected_note_ic,
+			}
 			if not safe_send(msg_on):
 				break  # Connection closed, exit loop
+
+			if selected_note_ic is not None:
+				with ic_history_lock:
+					_append_live_ic_sample_locked(note, selected_note_ic, {
+						"duration_seconds": duration_seconds,
+						"interval_seconds": interval_seconds,
+						"velocity": 100,
+						"_received_perf_time": time.perf_counter(),
+					})
 			
 			now = time.perf_counter()
 			if interval_seconds > 0 and now >= next_generation_time:

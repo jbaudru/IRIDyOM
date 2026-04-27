@@ -20,6 +20,7 @@ import statistics
 import signal
 from pathlib import Path
 from collections import deque, defaultdict
+from fractions import Fraction
 from urllib.parse import unquote, urlparse
 
 try:
@@ -188,6 +189,16 @@ MAX_MIDI = 84  # C6
 DEFAULT_TEMPO = 120  # BPM
 NOTE_DURATION_DIVISION = 1/4  # Note value (1/4 = quarter note, 1/8 = eighth note, etc.)
 NOTE_INTERVAL_DIVISION = 1/4  # Note value between onsets
+GRID_DIVISIONS = (
+	Fraction(1, 32),
+	Fraction(1, 16),
+	Fraction(1, 8),
+	Fraction(1, 6),
+	Fraction(1, 4),
+	Fraction(1, 3),
+	Fraction(1, 2),
+)
+GRID_TICKS_PER_BEAT = 480
 
 # Track last tempo to avoid duplicate logging
 last_tempo = DEFAULT_TEMPO
@@ -206,6 +217,9 @@ generation_params = {
 	'tempo': DEFAULT_TEMPO,  # BPM
 	'note_duration_division': NOTE_DURATION_DIVISION,  # Note value (e.g., 1/4, 1/8)
 	'note_interval_division': NOTE_INTERVAL_DIVISION,  # Note value between onsets
+	'transport_phase': None,
+	'transport_phase_client_time_ms': None,
+	'sequencer_quantize_to_grid': True,
 	'max_history': MAX_HISTORY_LENGTH,
 	'sequencer_running': False,
 	'mode': 'generate'  # 'generate', 'interact', or 'train'
@@ -235,7 +249,7 @@ ic_history_midi_file = None  # MIDI file whose note timings match the current IC
 ic_live_note_events = []  # Live-input timing events aligned with IC history
 ic_live_open_notes = defaultdict(deque)  # (pitch, channel) -> event indices waiting for note-off
 ic_live_last_perf_time = None
-LIVE_TICKS_PER_BEAT = 480
+LIVE_TICKS_PER_BEAT = GRID_TICKS_PER_BEAT
 ic_history_lock = threading.Lock()  # Thread-safe access to IC history
 
 
@@ -1499,18 +1513,135 @@ def refresh_available_models():
 		return 0
 
 
+def normalize_note_division(division):
+	"""Snap a note division to the supported Ableton grid values."""
+	if isinstance(division, Fraction):
+		value = division
+	else:
+		text = str(division).strip()
+		if '/' in text:
+			try:
+				value = Fraction(text)
+			except (ValueError, ZeroDivisionError):
+				value = Fraction(float(division)).limit_denominator(96)
+		else:
+			value = Fraction(float(division)).limit_denominator(96)
+	return min(GRID_DIVISIONS, key=lambda candidate: abs(float(candidate - value)))
+
+
+def note_division_to_beats(division):
+	"""Convert a whole-note division to beats using exact grid fractions."""
+	return normalize_note_division(division) * 4
+
+
+def note_division_to_ticks(division):
+	"""Convert a supported note division to exact sequencer ticks."""
+	return int(note_division_to_beats(division) * GRID_TICKS_PER_BEAT)
+
+
 def note_division_to_seconds(division, tempo_bpm):
-	"""Convert a note division (like 1/4, 1/8) to seconds based on tempo.
-	
-	Args:
-		division: Note value as fraction (e.g., 0.25 for 1/4 note, 0.125 for 1/8)
-		tempo_bpm: Tempo in beats per minute
-	
-	Returns:
-		Duration in seconds
-	"""
+	"""Convert a note division (like 1/4, 1/8) to seconds based on tempo."""
 	quarter_note_duration = 60.0 / tempo_bpm
-	return quarter_note_duration * division * 4
+	return quarter_note_duration * float(note_division_to_beats(division))
+
+
+def format_note_division(division):
+	value = normalize_note_division(division)
+	return f"{value.numerator}/{value.denominator}"
+
+
+def _parse_transport_phase_payload(payload, cmd=None):
+	"""Normalize transport phase data sent by listen.js/Max."""
+	phase = {}
+	if isinstance(payload, dict):
+		phase.update(payload)
+	elif isinstance(payload, (list, tuple)):
+		names = ('bar', 'beat', 'unit', 'ticks', 'tempo')
+		for idx, value in enumerate(payload[:len(names)]):
+			phase[names[idx]] = value
+	elif payload is not None:
+		phase['ticks'] = payload
+
+	cmd = cmd or {}
+	for key in (
+		'bar', 'beat', 'unit', 'ticks', 'tempo', 'client_time_ms',
+		'time_signature_numerator', 'time_signature_denominator',
+	):
+		if key in cmd and key not in phase:
+			phase[key] = cmd[key]
+	return phase
+
+
+def _transport_phase_to_beats(phase, at_client_time_ms=None):
+	"""Return Ableton song position in beats, projected to at_client_time_ms."""
+	if not phase:
+		return None
+
+	tempo = _coerce_float(phase.get('tempo')) or generation_params['tempo']
+	position_beats = _coerce_float(phase.get('position_beats'))
+	absolute_ticks = _coerce_float(phase.get('absolute_ticks'))
+	ticks = _coerce_float(phase.get('ticks'))
+
+	if position_beats is None and absolute_ticks is not None:
+		position_beats = absolute_ticks / GRID_TICKS_PER_BEAT
+
+	if position_beats is None and ticks is not None and abs(ticks) >= GRID_TICKS_PER_BEAT:
+		position_beats = ticks / GRID_TICKS_PER_BEAT
+
+	if position_beats is None:
+		bar = _coerce_int(phase.get('bar'), 1)
+		beat = _coerce_int(phase.get('beat'), 1)
+		beats_per_bar = _coerce_int(phase.get('time_signature_numerator'), 4)
+		if beats_per_bar <= 0:
+			beats_per_bar = 4
+		tick_offset = 0.0
+		if ticks is not None:
+			tick_offset = (ticks % GRID_TICKS_PER_BEAT) / GRID_TICKS_PER_BEAT
+		else:
+			unit = _coerce_float(phase.get('unit'))
+			if unit is not None:
+				tick_offset = (unit % GRID_TICKS_PER_BEAT) / GRID_TICKS_PER_BEAT
+		position_beats = max(0, bar - 1) * beats_per_bar + max(0, beat - 1) + tick_offset
+
+	phase_client_time = _coerce_float(phase.get('client_time_ms'))
+	if phase_client_time is not None and at_client_time_ms is not None:
+		elapsed_seconds = max(0.0, (float(at_client_time_ms) - phase_client_time) / 1000.0)
+		position_beats += elapsed_seconds * (float(tempo) / 60.0)
+
+	return position_beats
+
+
+def _quantized_start_delay_seconds(now_perf):
+	"""Delay the first sequencer note to the next selected Ableton grid point."""
+	if not generation_params.get('sequencer_quantize_to_grid', True):
+		return None
+
+	phase = generation_params.get('transport_phase')
+	if not phase:
+		return None
+
+	start_client_time_ms = generation_params.get('sequencer_start_client_time_ms')
+	position_beats = _transport_phase_to_beats(phase, at_client_time_ms=start_client_time_ms)
+	if position_beats is None:
+		return None
+
+	interval_beats = float(note_division_to_beats(generation_params['note_interval_division']))
+	if interval_beats <= 0:
+		return None
+
+	remainder = position_beats % interval_beats
+	epsilon = 1e-6
+	delay_beats = 0.0 if remainder <= epsilon else interval_beats - remainder
+	tempo = _coerce_float(phase.get('tempo')) or generation_params['tempo']
+	return delay_beats * (60.0 / float(tempo))
+
+
+def _sequencer_note_duration_seconds(interval_seconds):
+	"""Keep generated note lengths on-grid so duration does not delay later onsets."""
+	duration_seconds = get_note_duration_seconds()
+	if duration_seconds > interval_seconds:
+		return max(0.001, interval_seconds - 0.001)
+	return duration_seconds
 
 
 def get_note_duration_seconds():
@@ -2030,7 +2161,13 @@ def handle_client(conn, addr):
 			
 			if (not was_generating) or abs(interval_seconds - scheduled_interval_seconds) > 1e-9:
 				scheduled_interval_seconds = interval_seconds
-				next_generation_time = now + interval_seconds
+				if not was_generating:
+					start_delay = _quantized_start_delay_seconds(now)
+					if start_delay is None:
+						start_delay = interval_seconds
+					next_generation_time = now + max(0.0, start_delay)
+				else:
+					next_generation_time = now + interval_seconds
 				was_generating = True
 			
 			if now < next_generation_time:
@@ -2112,8 +2249,9 @@ def handle_client(conn, addr):
 				graphidyom_service.observe_in_session(session_id=session_id, midi_notes=[note])
 			enforce_history_limit_on_session()
 			
-			# Convert tempo-based divisions to seconds
-			duration_seconds = get_note_duration_seconds()
+			# Convert tempo-based divisions to seconds. Keep duration within the
+			# interonset grid so output-side note gating cannot shift later onsets.
+			duration_seconds = _sequencer_note_duration_seconds(interval_seconds)
 			
 			# Send note_on with duration (makenote will handle note_off)
 			msg_on = {"type": "midi", "cmd": "note_on", "note": note, "vel": 100, "duration": duration_seconds}
@@ -2899,10 +3037,24 @@ def handle_parameter_change(cmd, addr, conn):
 			print(f"  [{addr[1]}] Set probabilistic: {generation_params['use_probabilistic']}")
 
 		if 'sequencer_running' in cmd:
+			if 'sequencer_phase' in cmd:
+				phase = _parse_transport_phase_payload(cmd['sequencer_phase'], cmd)
+				generation_params['transport_phase'] = phase
+				generation_params['transport_phase_client_time_ms'] = _coerce_float(phase.get('client_time_ms'))
 			val = str(cmd['sequencer_running']).lower()
+			was_running = bool(generation_params.get('sequencer_running'))
 			generation_params['sequencer_running'] = val in ['true', '1', 'yes', 'on']
+			if generation_params['sequencer_running'] and not was_running:
+				generation_params['sequencer_start_client_time_ms'] = _coerce_float(cmd.get('client_time_ms'))
+			elif not generation_params['sequencer_running']:
+				generation_params['sequencer_start_client_time_ms'] = None
 			state = "running" if generation_params['sequencer_running'] else "paused"
 			print(f"  {client_info} Sequencer: {param_value(state)}")
+
+		if 'sequencer_phase' in cmd and 'sequencer_running' not in cmd:
+			phase = _parse_transport_phase_payload(cmd['sequencer_phase'], cmd)
+			generation_params['transport_phase'] = phase
+			generation_params['transport_phase_client_time_ms'] = _coerce_float(phase.get('client_time_ms'))
 		
 		if 'tempo' in cmd:
 			val = float(cmd['tempo'])
@@ -2912,16 +3064,16 @@ def handle_parameter_change(cmd, addr, conn):
 				last_tempo = generation_params['tempo']
 		
 		if 'note_duration_division' in cmd:
-			val = float(cmd['note_duration_division'])
-			generation_params['note_duration_division'] = max(1/64, min(4.0, val))
+			val = normalize_note_division(cmd['note_duration_division'])
+			generation_params['note_duration_division'] = val
 			dur_sec = get_note_duration_seconds()
-			print(f"  [{addr[1]}] Set note_duration_division: {generation_params['note_duration_division']} ({dur_sec:.3f}s at {generation_params['tempo']:.0f} BPM)")
+			print(f"  [{addr[1]}] Set note_duration_division: {format_note_division(val)} ({dur_sec:.3f}s at {generation_params['tempo']:.0f} BPM)")
 		
 		if 'note_interval_division' in cmd:
-			val = float(cmd['note_interval_division'])
-			generation_params['note_interval_division'] = max(1/64, min(4.0, val))
+			val = normalize_note_division(cmd['note_interval_division'])
+			generation_params['note_interval_division'] = val
 			int_sec = get_note_interval_seconds()
-			print(f"  [{addr[1]}] Set note_interval_division: {generation_params['note_interval_division']} ({int_sec:.3f}s at {generation_params['tempo']:.0f} BPM)")
+			print(f"  [{addr[1]}] Set note_interval_division: {format_note_division(val)} ({int_sec:.3f}s at {generation_params['tempo']:.0f} BPM)")
 		
 		if 'max_history' in cmd:
 			val = int(cmd['max_history'])

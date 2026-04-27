@@ -51,6 +51,7 @@ if (!inNode) {
 	var currentlyPlayingNote = null;
 	var currentNoteEndTime = 0;  // When the current note is supposed to end (timestamp in ms)
 	var minGapBetweenNotes = 10; // milliseconds - minimum gap after note ends before next note starts
+	var latestSequencerPhase = null;
 	
 	// Queue for pending notes to prevent duplicates and ensure strict sequencing
 	var pendingNoteQueue = [];  // Array of {pitch, vel, durationMs}
@@ -145,6 +146,18 @@ if (!inNode) {
 		params.client_time_ms = Date.now();
 		addLiveNoteArgs(params, args, 1);
 		sendParameter(params);
+	}
+
+	function storeSequencerPhase(args) {
+		var values = Array.prototype.slice.call(args || []);
+		latestSequencerPhase = {
+			bar: parseFiniteNumber(values[0]),
+			beat: parseFiniteNumber(values[1]),
+			unit: parseFiniteNumber(values[2]),
+			ticks: parseFiniteNumber(values[3]),
+			tempo: parseFiniteNumber(values[4]),
+			client_time_ms: Date.now()
+		};
 	}
 
 	function flattenArgs(args) {
@@ -514,6 +527,9 @@ if (!inNode) {
 		maxApi.addHandler('tempo', function(val) {
 			sendParameter({tempo: parseFloat(val)});
 		});
+		maxApi.addHandler('sequencer_phase', function() {
+			storeSequencerPhase(arguments);
+		});
 		maxApi.addHandler('note_duration_division', function(val) {
 			sendParameter({note_duration_division: parseFloat(val)});
 		});
@@ -526,7 +542,14 @@ if (!inNode) {
 		maxApi.addHandler('sequencer_running', function(val) {
 			var normalized = String(val).toLowerCase();
 			var running = !(normalized === '0' || normalized === 'false' || normalized === 'off');
-			sendParameter({sequencer_running: running});
+			var params = {
+				sequencer_running: running,
+				client_time_ms: Date.now()
+			};
+			if (latestSequencerPhase) {
+				params.sequencer_phase = latestSequencerPhase;
+			}
+			sendParameter(params);
 		});
 		maxApi.addHandler('max_history', function(val) {
 			sendParameter({max_history: parseInt(val)});

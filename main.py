@@ -19,7 +19,7 @@ import math
 import statistics
 import signal
 from pathlib import Path
-from collections import deque
+from collections import deque, defaultdict
 from urllib.parse import unquote, urlparse
 
 try:
@@ -230,7 +230,12 @@ last_analyzed_file = None  # Path to the last file analyzed with analyse_and_gen
 
 # Global IC history for plotting
 ic_history = []  # List of IC values for export/plotting
-ic_notes_history = []  # List of (note, ic) tuples for pianoroll background
+ic_notes_history = []  # List of MIDI note numbers for pianoroll fallback
+ic_history_midi_file = None  # MIDI file whose note timings match the current IC history
+ic_live_note_events = []  # Live-input timing events aligned with IC history
+ic_live_open_notes = defaultdict(deque)  # (pitch, channel) -> event indices waiting for note-off
+ic_live_last_perf_time = None
+LIVE_TICKS_PER_BEAT = 480
 ic_history_lock = threading.Lock()  # Thread-safe access to IC history
 
 
@@ -371,11 +376,107 @@ def normalize_client_path(path_value):
 		return first
 
 
+def _pick_melody_track(midi_file):
+	"""Pick the track that most likely contains the monophonic melody notes."""
+	if not midi_file.tracks:
+		return None
+	if len(midi_file.tracks) == 1:
+		return midi_file.tracks[0]
+	best_track = None
+	best_count = -1
+	for track in midi_file.tracks:
+		count = 0
+		for msg in track:
+			if msg.type == 'note_on' and getattr(msg, 'velocity', 0) > 0:
+				count += 1
+		if count > best_count:
+			best_count = count
+			best_track = track
+	return best_track if best_count > 0 else None
+
+
+def _extract_note_timing(track):
+	"""Extract pitch/channel-aware note timings from one MIDI track."""
+	open_notes = defaultdict(deque)
+	events = []
+	abs_time = 0
+	last_note_on_channel = 0
+	last_note_on_velocity = 100
+
+	for msg_index, msg in enumerate(track):
+		abs_time += msg.time
+		if msg.type == 'note_on' and getattr(msg, 'velocity', 0) > 0:
+			channel = getattr(msg, 'channel', 0)
+			velocity = getattr(msg, 'velocity', 100)
+			open_notes[(msg.note, channel)].append((abs_time, velocity, msg_index))
+			last_note_on_channel = channel
+			last_note_on_velocity = velocity
+		elif msg.type == 'note_off' or (msg.type == 'note_on' and getattr(msg, 'velocity', 0) == 0):
+			channel = getattr(msg, 'channel', 0)
+			key = (msg.note, channel)
+			if open_notes[key]:
+				start_abs, start_velocity, on_index = open_notes[key].popleft()
+				duration_ticks = abs_time - start_abs
+				if duration_ticks > 0:
+					events.append({
+						'pitch': msg.note,
+						'channel': channel,
+						'velocity': start_velocity,
+						'start_ticks': start_abs,
+						'end_ticks': abs_time,
+						'duration_ticks': duration_ticks,
+						'on_index': on_index,
+						'off_index': msg_index,
+					})
+
+	events.sort(key=lambda n: (n['start_ticks'], n['on_index']))
+	onsets = [n['start_ticks'] for n in events]
+	durations = [n['duration_ticks'] for n in events]
+	intervals = [onsets[i] - onsets[i - 1] for i in range(1, len(onsets))]
+
+	return {
+		'track_end_abs': abs_time,
+		'events': events,
+		'pairs': [
+			(
+				n['start_ticks'],
+				n['end_ticks'],
+				n['pitch'],
+				n['channel'],
+				n['velocity'],
+			)
+			for n in events
+		],
+		'onsets': onsets,
+		'durations': durations,
+		'intervals': intervals,
+		'last_onset': onsets[-1] if onsets else None,
+		'last_end': max((n['end_ticks'] for n in events), default=None),
+		'last_channel': last_note_on_channel,
+		'last_velocity': last_note_on_velocity,
+	}
+
+
+def _extract_midi_file_timing(file_path):
+	"""Load a MIDI file and return timing info for its selected melody track."""
+	import mido
+
+	midi_path = normalize_client_path(file_path)
+	mid = mido.MidiFile(str(midi_path))
+	track = _pick_melody_track(mid)
+	if track is None:
+		return None
+	timing = _extract_note_timing(track)
+	timing['ticks_per_beat'] = mid.ticks_per_beat
+	return timing
+
+
 def parse_midi_file(file_path):
 	"""Parse MIDI file and extract note sequence with durations and intervals.
 	
 	Returns:
-		List of note events where each event is a dict: {'pitch': midi_note, 'duration': 0-16, 'interval': 0-16}
+		List of note events where each event includes pitch, normalized duration/interval,
+		and exact tick timing fields.
 		Or None if file cannot be parsed.
 	"""
 	try:
@@ -385,51 +486,25 @@ def parse_midi_file(file_path):
 		return None
 	
 	try:
-		midi_path = normalize_client_path(file_path)
-		mid = mido.MidiFile(str(midi_path))
-		note_events = []
-		note_on_stack = []  # Track open note_on events
-		
-		# Find tick/time quantization parameters
-		ticks_per_beat = mid.ticks_per_beat
-		min_duration = float('inf')
-		max_duration = 0
-		durations = []
-		intervals = []
-		last_note_time = 0
-		current_time = 0
-		
-		# First pass: collect all note events with raw timing
-		raw_notes = []
-		for track in mid.tracks:
-			for msg in track:
-				current_time += msg.time
-				if msg.type == 'note_on' and msg.velocity > 0:
-					note_on_stack.append({'pitch': msg.note, 'time': current_time})
-				elif (msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0)):
-					if note_on_stack:
-						note_start = note_on_stack.pop()
-						duration = current_time - note_start['time']
-						interval = note_start['time'] - last_note_time if last_note_time > 0 else 0
-						
-						raw_notes.append({
-							'pitch': note_start['pitch'],
-							'duration': duration,
-							'interval': interval,
-							'time': note_start['time']
-						})
-						
-						if duration > 0:
-							durations.append(duration)
-							min_duration = min(min_duration, duration)
-							max_duration = max(max_duration, duration)
-						if interval > 0:
-							intervals.append(interval)
-						
-						last_note_time = note_start['time']
-		
+		timing = _extract_midi_file_timing(file_path)
+		if timing is None:
+			return None
+		raw_notes = timing['events']
 		if not raw_notes:
 			return None
+
+		note_events = []
+		durations = [note['duration_ticks'] for note in raw_notes if note['duration_ticks'] > 0]
+		interval_ticks_by_index = []
+		for idx, note in enumerate(raw_notes):
+			if idx == 0:
+				interval_ticks_by_index.append(0)
+			else:
+				interval_ticks_by_index.append(note['start_ticks'] - raw_notes[idx - 1]['start_ticks'])
+
+		intervals = [interval for interval in interval_ticks_by_index if interval > 0]
+		min_duration = min(durations) if durations else 0
+		max_duration = max(durations) if durations else 0
 		
 		# Quantize durations to 0-16 range
 		if max_duration > min_duration:
@@ -445,17 +520,24 @@ def parse_midi_file(file_path):
 			interval_scale = 1.0
 		
 		# Second pass: normalize and quantize
-		for note in raw_notes:
-			normalized_duration = int((note['duration'] - min_duration) * duration_scale) if max_duration > min_duration else 8
+		for idx, note in enumerate(raw_notes):
+			duration_ticks = note['duration_ticks']
+			interval_ticks = interval_ticks_by_index[idx]
+			normalized_duration = int((duration_ticks - min_duration) * duration_scale) if max_duration > min_duration else 8
 			normalized_duration = max(0, min(16, normalized_duration))  # Clamp to 0-16
 			
-			normalized_interval = int(note['interval'] * interval_scale) if note['interval'] > 0 else 0
+			normalized_interval = int(interval_ticks * interval_scale) if interval_ticks > 0 else 0
 			normalized_interval = max(0, min(16, normalized_interval))  # Clamp to 0-16
 			
 			note_events.append({
 				'pitch': note['pitch'],
 				'duration': normalized_duration,
-				'interval': normalized_interval
+				'interval': normalized_interval,
+				'start_ticks': note['start_ticks'],
+				'end_ticks': note['end_ticks'],
+				'duration_ticks': duration_ticks,
+				'interval_ticks': interval_ticks,
+				'ticks_per_beat': timing['ticks_per_beat'],
 			})
 		
 		return note_events if note_events else None
@@ -479,7 +561,7 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 			- 2 = least probable note (bottom)
 			If provided, generates 8 notes; otherwise generates 1 note (old behavior)
 	"""
-	global graphidyom_service, graphidyom_model_id
+	global graphidyom_service, graphidyom_model_id, ic_history_midi_file
 	
 	try:
 		import mido
@@ -538,68 +620,6 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 	# Load original MIDI file and extract timing information
 	try:
 		mid = mido.MidiFile(str(input_path))
-		
-		def _pick_melody_track(midi_file):
-			"""Pick the track that most likely contains the melody notes."""
-			if not midi_file.tracks:
-				return None
-			if len(midi_file.tracks) == 1:
-				return midi_file.tracks[0]
-			best_track = None
-			best_count = -1
-			for t in midi_file.tracks:
-				count = 0
-				for m in t:
-					if m.type == 'note_on' and getattr(m, 'velocity', 0) > 0:
-						count += 1
-				if count > best_count:
-					best_count = count
-					best_track = t
-			return best_track
-		
-		def _extract_note_timing(track):
-			"""Extract absolute onset/duration and a reasonable interval grid from a MIDI track."""
-			from collections import defaultdict, deque
-			abs_time = 0
-			open_notes = defaultdict(deque)  # (pitch, channel) -> deque[start_abs_time]
-			pairs = []  # list of (start_abs, end_abs, pitch, channel, velocity)
-			last_note_on_channel = 0
-			last_note_on_velocity = 100
-			
-			for msg in track:
-				abs_time += msg.time
-				if msg.type == 'note_on' and getattr(msg, 'velocity', 0) > 0:
-					channel = getattr(msg, 'channel', 0)
-					open_notes[(msg.note, channel)].append((abs_time, msg.velocity))
-					last_note_on_channel = channel
-					last_note_on_velocity = msg.velocity
-				elif msg.type == 'note_off' or (msg.type == 'note_on' and getattr(msg, 'velocity', 0) == 0):
-					channel = getattr(msg, 'channel', 0)
-					key = (msg.note, channel)
-					if open_notes[key]:
-						start_abs, start_vel = open_notes[key].popleft()
-						end_abs = abs_time
-						if end_abs > start_abs:
-							pairs.append((start_abs, end_abs, msg.note, channel, start_vel))
-			
-			pairs.sort(key=lambda x: x[0])
-			onsets = [p[0] for p in pairs]
-			durations = [p[1] - p[0] for p in pairs]
-			intervals = [onsets[i] - onsets[i - 1] for i in range(1, len(onsets))]
-			last_onset = onsets[-1] if onsets else None
-			last_end = max((p[1] for p in pairs), default=None)
-			
-			return {
-				'track_end_abs': abs_time,
-				'pairs': pairs,
-				'onsets': onsets,
-				'durations': durations,
-				'intervals': intervals,
-				'last_onset': last_onset,
-				'last_end': last_end,
-				'last_channel': last_note_on_channel,
-				'last_velocity': last_note_on_velocity,
-			}
 		
 		# Pick a melody track and remove end_of_track so we can append validly
 		melody_track = _pick_melody_track(mid)
@@ -754,6 +774,8 @@ def generate_and_save_next_note(input_file, output_folder, addr, conn, output_fi
 		
 		# Save the new MIDI file
 		mid.save(str(output_file))
+		with ic_history_lock:
+			ic_history_midi_file = str(output_file)
 		
 		add_log(f"  [{addr[1]}] Saved extended MIDI with {len(generated_notes)} new notes: {output_filename}")
 		
@@ -799,7 +821,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 		addr: Client address
 		conn: Connection socket
 	"""
-	global graphidyom_service, graphidyom_model_id, last_analyzed_file
+	global graphidyom_service, graphidyom_model_id, last_analyzed_file, ic_history_midi_file
 	
 	try:
 		import mido
@@ -1058,6 +1080,8 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 		# Save the modified MIDI file to the specified output folder
 		output_file = output_path / output_filename
 		mid.save(str(output_file))
+		with ic_history_lock:
+			ic_history_midi_file = str(output_file)
 		
 		add_log(f"  [{addr[1]}] Variate complete! Saved to: {output_filename}")
 		
@@ -1089,7 +1113,7 @@ def variate_midi_file(output_folder, part, surpriseness, addr, conn):
 
 def analyze_midi_sequence(file_path, addr, conn):
 	"""Analyze a MIDI file sequence note-by-note and calculate IC for each note."""
-	global graphidyom_service, graphidyom_model_id, last_analyzed_file
+	global graphidyom_service, graphidyom_model_id, last_analyzed_file, ic_history_midi_file
 	
 	file_path = normalize_client_path(file_path)
 	if not file_path.exists():
@@ -1099,8 +1123,7 @@ def analyze_midi_sequence(file_path, addr, conn):
 		return
 
 	with ic_history_lock:
-		ic_history.clear()
-		ic_notes_history.clear()
+		_clear_ic_history_locked(source_midi_file=str(file_path))
 	add_log(f"  [{addr[1]}] IC history cleared for new analysis")
 
 	# Store the file path for potential later use in generate_midi_file
@@ -1171,6 +1194,9 @@ def analyze_midi_sequence(file_path, addr, conn):
 					"note": note,
 					"duration": duration,
 					"interval": interval,
+					"start_ticks": note_event.get('start_ticks'),
+					"duration_ticks": note_event.get('duration_ticks'),
+					"interval_ticks": note_event.get('interval_ticks'),
 					"probability": note_prob,
 					"ic": note_ic,
 					"in_range": min_note <= note <= max_note
@@ -1203,6 +1229,9 @@ def analyze_midi_sequence(file_path, addr, conn):
 					"note": note,
 					"duration": duration,
 					"interval": interval,
+					"start_ticks": note_event.get('start_ticks'),
+					"duration_ticks": note_event.get('duration_ticks'),
+					"interval_ticks": note_event.get('interval_ticks'),
 					"probability": 1.0,
 					"ic": 0.0,
 					"in_range": min_note <= note <= max_note
@@ -1500,6 +1529,239 @@ def get_note_interval_seconds():
 	)
 
 
+def _clear_ic_history_locked(source_midi_file=None):
+	"""Clear IC plot state. Caller must hold ic_history_lock."""
+	global ic_history_midi_file, ic_live_last_perf_time
+	ic_history.clear()
+	ic_notes_history.clear()
+	ic_live_note_events.clear()
+	ic_live_open_notes.clear()
+	ic_live_last_perf_time = None
+	ic_history_midi_file = source_midi_file
+
+
+def _coerce_float(value):
+	try:
+		if value is None:
+			return None
+		return float(value)
+	except (TypeError, ValueError):
+		return None
+
+
+def _coerce_int(value, default=0):
+	try:
+		if value is None:
+			return default
+		return int(float(value))
+	except (TypeError, ValueError):
+		return default
+
+
+def _timing_float(timing, *keys):
+	if not timing:
+		return None
+	for key in keys:
+		if key in timing:
+			value = _coerce_float(timing.get(key))
+			if value is not None:
+				return value
+	return None
+
+
+def _seconds_to_live_ticks(seconds, tempo_bpm=None):
+	tempo = max(1e-9, float(tempo_bpm or generation_params['tempo']))
+	beat_seconds = 60.0 / tempo
+	return int(max(1, round((float(seconds) / beat_seconds) * LIVE_TICKS_PER_BEAT)))
+
+
+def _beats_to_live_ticks(beats):
+	return int(max(1, round(float(beats) * LIVE_TICKS_PER_BEAT)))
+
+
+def _duration_ticks_from_live_timing(timing):
+	value = _timing_float(timing, 'duration_ticks')
+	if value is not None:
+		return int(max(1, round(value))), 'explicit_ticks'
+	value = _timing_float(timing, 'duration_beats', 'length_beats')
+	if value is not None:
+		return _beats_to_live_ticks(value), 'explicit_beats'
+	value = _timing_float(timing, 'duration_ms', 'length_ms')
+	if value is not None:
+		return _seconds_to_live_ticks(value / 1000.0), 'explicit_ms'
+	value = _timing_float(timing, 'duration_seconds', 'duration_sec', 'length_seconds')
+	if value is not None:
+		return _seconds_to_live_ticks(value), 'explicit_seconds'
+	value = _timing_float(timing, 'duration')
+	if value is not None:
+		return _seconds_to_live_ticks(value), 'explicit_seconds'
+	return _seconds_to_live_ticks(get_note_duration_seconds()), 'provisional'
+
+
+def _start_ticks_from_live_timing(timing, now_perf):
+	global ic_live_last_perf_time
+
+	value = _timing_float(timing, 'start_ticks', 'onset_ticks')
+	if value is not None:
+		return int(max(0, round(value)))
+	value = _timing_float(timing, 'start_beats', 'onset_beats')
+	if value is not None:
+		return int(max(0, round(value * LIVE_TICKS_PER_BEAT)))
+	value = _timing_float(timing, 'start_ms', 'onset_ms')
+	if value is not None:
+		return int(max(0, _seconds_to_live_ticks(value / 1000.0)))
+	value = _timing_float(timing, 'start_seconds', 'onset_seconds', 'start_sec')
+	if value is not None:
+		return int(max(0, _seconds_to_live_ticks(value)))
+
+	if ic_live_note_events:
+		previous_start = ic_live_note_events[-1]['start_ticks']
+		value = _timing_float(timing, 'interval_ticks', 'ioi_ticks')
+		if value is not None:
+			return previous_start + int(max(1, round(value)))
+		value = _timing_float(timing, 'interval_beats', 'ioi_beats')
+		if value is not None:
+			return previous_start + _beats_to_live_ticks(value)
+		value = _timing_float(timing, 'interval_ms', 'ioi_ms')
+		if value is not None:
+			return previous_start + _seconds_to_live_ticks(value / 1000.0)
+		value = _timing_float(timing, 'interval_seconds', 'ioi_seconds', 'interval')
+		if value is not None:
+			return previous_start + _seconds_to_live_ticks(value)
+		if ic_live_last_perf_time is not None:
+			elapsed = max(0.0, now_perf - ic_live_last_perf_time)
+			return previous_start + _seconds_to_live_ticks(elapsed)
+
+	return 0
+
+
+def _append_live_ic_sample_locked(note, ic_value, live_timing=None):
+	"""Append an IC sample and a live timing event. Caller must hold ic_history_lock."""
+	global ic_history_midi_file, ic_live_last_perf_time
+
+	if ic_history_midi_file is not None:
+		_clear_ic_history_locked(source_midi_file=None)
+
+	timing = live_timing or {}
+	client_time_ms = _coerce_float(timing.get('client_time_ms'))
+	now_perf = (
+		(client_time_ms / 1000.0)
+		if client_time_ms is not None
+		else (_coerce_float(timing.get('_received_perf_time')) or time.perf_counter())
+	)
+	note = int(note)
+	channel = _coerce_int(timing.get('channel'), 0)
+	velocity = _coerce_int(timing.get('velocity', timing.get('vel')), 100)
+	start_ticks = _start_ticks_from_live_timing(timing, now_perf)
+
+	if ic_live_note_events:
+		previous = ic_live_note_events[-1]
+		if previous.get('duration_source') in ('provisional', 'inferred_ioi') and start_ticks > previous['start_ticks']:
+			previous['duration_ticks'] = start_ticks - previous['start_ticks']
+			previous['end_ticks'] = start_ticks
+			previous['duration_source'] = 'inferred_ioi'
+
+	duration_ticks, duration_source = _duration_ticks_from_live_timing(timing)
+	event = {
+		'pitch': note,
+		'channel': channel,
+		'velocity': velocity,
+		'start_ticks': start_ticks,
+		'end_ticks': start_ticks + duration_ticks,
+		'duration_ticks': duration_ticks,
+		'ticks_per_beat': LIVE_TICKS_PER_BEAT,
+		'duration_source': duration_source,
+		'_start_perf_time': now_perf,
+	}
+	event_index = len(ic_live_note_events)
+	ic_live_note_events.append(event)
+	if duration_source == 'provisional':
+		ic_live_open_notes[(note, channel)].append(event_index)
+
+	ic_history_midi_file = None
+	ic_history.append(ic_value)
+	ic_notes_history.append(note)
+	ic_live_last_perf_time = now_perf
+
+
+def _update_live_note_off_locked(note, live_timing=None):
+	"""Close the most recent live note event for note-off input. Caller must hold ic_history_lock."""
+	timing = live_timing or {}
+	note = int(note)
+	channel = _coerce_int(timing.get('channel'), 0)
+	open_key = (note, channel)
+	if not ic_live_open_notes.get(open_key):
+		for candidate_key in list(ic_live_open_notes.keys()):
+			if candidate_key[0] == note and ic_live_open_notes[candidate_key]:
+				open_key = candidate_key
+				break
+	if not ic_live_open_notes.get(open_key):
+		return False
+
+	event_index = ic_live_open_notes[open_key].popleft()
+	if event_index >= len(ic_live_note_events):
+		return False
+
+	event = ic_live_note_events[event_index]
+	duration_ticks, duration_source = _duration_ticks_from_live_timing(timing)
+	if duration_source == 'provisional':
+		start_perf = event.get('_start_perf_time')
+		if start_perf is not None:
+			client_time_ms = _coerce_float(timing.get('client_time_ms'))
+			now_perf = (
+				(client_time_ms / 1000.0)
+				if client_time_ms is not None
+				else (_coerce_float(timing.get('_received_perf_time')) or time.perf_counter())
+			)
+			duration_ticks = _seconds_to_live_ticks(max(0.0, now_perf - start_perf))
+		else:
+			duration_ticks = max(1, event.get('duration_ticks', 1))
+		duration_source = 'note_off'
+
+	event['duration_ticks'] = duration_ticks
+	event['end_ticks'] = event['start_ticks'] + duration_ticks
+	event['duration_source'] = duration_source
+	return True
+
+
+def _live_timing_from_command(cmd):
+	keys = (
+		'velocity', 'vel', 'channel',
+		'client_time_ms',
+		'duration', 'duration_seconds', 'duration_sec', 'duration_ms', 'duration_beats', 'duration_ticks',
+		'length_seconds', 'length_ms', 'length_beats',
+		'start_seconds', 'start_sec', 'start_ms', 'start_beats', 'start_ticks',
+		'onset_seconds', 'onset_ms', 'onset_beats', 'onset_ticks',
+		'interval', 'interval_seconds', 'interval_ms', 'interval_beats', 'interval_ticks',
+		'ioi_seconds', 'ioi_ms', 'ioi_beats', 'ioi_ticks',
+	)
+	return {key: cmd[key] for key in keys if key in cmd}
+
+
+def _parse_live_note_payload(payload, cmd=None):
+	timing = _live_timing_from_command(cmd or {})
+	note_value = payload
+
+	if isinstance(payload, dict):
+		timing.update(_live_timing_from_command(payload))
+		for key in ('note', 'pitch', 'midi', 'user_note'):
+			if key in payload:
+				note_value = payload[key]
+				break
+	elif isinstance(payload, (list, tuple)):
+		if len(payload) == 0:
+			raise ValueError("Empty live note payload")
+		note_value = payload[0]
+		if len(payload) > 1 and 'velocity' not in timing and 'vel' not in timing:
+			timing['velocity'] = payload[1]
+		if len(payload) > 2 and not any(k in timing for k in ('duration_ms', 'duration_seconds', 'duration')):
+			timing['duration_ms'] = payload[2]
+		if len(payload) > 3 and 'channel' not in timing:
+			timing['channel'] = payload[3]
+
+	return int(float(note_value)), timing
+
+
 def select_next_note_from_predictions(predictions, midi_history):
 	"""Select next MIDI note from GraphIDYOM predictions."""
 	# Ensure valid MIDI range
@@ -1554,7 +1816,7 @@ def trim_midi_history(midi_history):
 
 
 def handle_client(conn, addr):
-	global server_running, graphidyom_model_id, graphidyom_service
+	global server_running, graphidyom_model_id, graphidyom_service, ic_history_midi_file
 	add_log(f"{success(f'Client connected from {addr[0]}:{addr[1]}')}\n")
 	
 	# Register this connection
@@ -1677,11 +1939,29 @@ def handle_client(conn, addr):
 						try:
 							cmd = json.loads(line)
 							# Handle user note input in interact mode
+							if 'user_note_off' in cmd:
+								if generation_params['mode'] != 'interact':
+									continue
+								note, live_timing = _parse_live_note_payload(cmd['user_note_off'], cmd)
+								live_timing['_received_perf_time'] = time.perf_counter()
+								handle_user_note_off(note, live_timing, addr)
+								continue
+							if 'user_note_on' in cmd:
+								if generation_params['mode'] != 'interact':
+									continue
+								note, live_timing = _parse_live_note_payload(cmd['user_note_on'], cmd)
+								live_timing['_received_perf_time'] = time.perf_counter()
+								enforce_history_limit_on_session()
+								handle_user_note(note, midi_history, session_id, addr, conn, live_timing=live_timing)
+								enforce_history_limit_on_session()
+								continue
 							if 'user_note' in cmd:
 								if generation_params['mode'] != 'interact':
 									continue
+								note, live_timing = _parse_live_note_payload(cmd['user_note'], cmd)
+								live_timing['_received_perf_time'] = time.perf_counter()
 								enforce_history_limit_on_session()
-								handle_user_note(cmd['user_note'], midi_history, session_id, addr, conn)
+								handle_user_note(note, midi_history, session_id, addr, conn, live_timing=live_timing)
 								enforce_history_limit_on_session()
 								continue
 							# Handle training note input in train mode
@@ -1698,8 +1978,7 @@ def handle_client(conn, addr):
 								reset_prediction_session_from_history()
 								# Also clear IC history when STM is reset
 								with ic_history_lock:
-									ic_history.clear()
-									ic_notes_history.clear()
+									_clear_ic_history_locked(source_midi_file=None)
 								add_log(f"{success(f'STM history reset by client {addr[1]}')}:{Colors.END}")
 								add_log(f"{success(f'IC history cleared')}:{Colors.END}")
 								response = {"type": "reset_ack", "status": "cleared", "message": "STM history cleared"}
@@ -1866,9 +2145,9 @@ def handle_client(conn, addr):
 			pass
 
 
-def handle_user_note(note, midi_history, session_id, addr, conn):
+def handle_user_note(note, midi_history, session_id, addr, conn, live_timing=None):
 	"""Handle user note input in interact mode."""
-	global graphidyom_service, graphidyom_model_id
+	global graphidyom_service, graphidyom_model_id, ic_history_midi_file
 	
 	try:
 		# If history is empty (e.g., after reset), just add the first note
@@ -1891,8 +2170,7 @@ def handle_user_note(note, midi_history, session_id, addr, conn):
 			
 			# Track IC for export
 			with ic_history_lock:
-				ic_history.append(0.0)
-				ic_notes_history.append(note)
+				_append_live_ic_sample_locked(note, 0.0, live_timing)
 			
 			conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 			add_log(f"  [{addr[1]}] First note added: {note} (building history...)")
@@ -1962,8 +2240,7 @@ def handle_user_note(note, midi_history, session_id, addr, conn):
 		# Track IC for export (both user notes and file analysis notes)
 		if user_note_ic is not None:
 			with ic_history_lock:
-				ic_history.append(user_note_ic)
-				ic_notes_history.append(note)
+				_append_live_ic_sample_locked(note, user_note_ic, live_timing)
 		
 		# Send predictions back to Max with user note IC
 		response = {
@@ -1981,6 +2258,17 @@ def handle_user_note(note, midi_history, session_id, addr, conn):
 		
 	except Exception as e:
 		add_log(f"⚠ Error processing user note: {e}")
+
+
+def handle_user_note_off(note, live_timing, addr):
+	"""Update live input duration from a note-off event."""
+	try:
+		with ic_history_lock:
+			updated = _update_live_note_off_locked(note, live_timing)
+		if updated:
+			add_log(f"  [{addr[1]}] Live note-off captured for {note}")
+	except Exception as e:
+		add_log(f"⚠ Error processing user note-off: {e}")
 
 
 def handle_train_note(note, addr, conn):
@@ -2323,7 +2611,7 @@ def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
 		filename: Optional plot filename (defaults to "IC-evolution.png")
 		midi_file: Optional MIDI file path this plot should be associated with
 	"""
-	global ic_history, ic_notes_history
+	global ic_history, ic_notes_history, ic_history_midi_file
 	
 	if not HAS_MATPLOTLIB:
 		response = {
@@ -2349,41 +2637,109 @@ def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
 		# Make a copy to work with
 		ic_data = list(ic_history)
 		notes_data = list(ic_notes_history)
+		live_events_data = [dict(event) for event in ic_live_note_events]
+		source_midi_file = midi_file or ic_history_midi_file
 	
 	try:
+		timing = None
+		piano_events = []
+		ticks_per_beat = 480
+		if source_midi_file:
+			try:
+				timing = _extract_midi_file_timing(source_midi_file)
+				if timing and timing.get('events'):
+					piano_events = timing['events']
+					ticks_per_beat = int(timing.get('ticks_per_beat') or ticks_per_beat)
+			except Exception as e:
+				add_log(f"  [{addr[1]}] Could not read MIDI timing for plot: {e}")
+		elif live_events_data:
+			piano_events = live_events_data
+			ticks_per_beat = LIVE_TICKS_PER_BEAT
+
+		use_exact_timing = bool(piano_events)
+		if use_exact_timing:
+			aligned_len = min(len(ic_data), len(piano_events))
+			if aligned_len == 0:
+				use_exact_timing = False
+			else:
+				if len(ic_data) != len(piano_events):
+					add_log(
+						f"  [{addr[1]}] Plot note/IC count mismatch: "
+						f"{len(piano_events)} MIDI notes, {len(ic_data)} IC samples; plotting {aligned_len}"
+					)
+				plot_events = piano_events[:aligned_len]
+				plot_ic_data = ic_data[:aligned_len]
+				x_values = [event['start_ticks'] / ticks_per_beat for event in plot_events]
+				x_ends = [event['end_ticks'] / ticks_per_beat for event in plot_events]
+				plot_notes = [event['pitch'] for event in plot_events]
+
+		if not use_exact_timing:
+			plot_ic_data = ic_data
+			plot_notes = notes_data
+			x_values = list(range(len(plot_ic_data)))
+			x_ends = [x + 0.5 for x in x_values]
+			plot_events = []
+
 		# Create figure with dark theme
 		plt.style.use('dark_background')
 		fig, ax = plt.subplots(figsize=(14, 7))
 		
 		# Get min/max MIDI notes for pianoroll y-axis scaling
-		min_midi = min(notes_data) if notes_data else 48
-		max_midi = max(notes_data) if notes_data else 84
-		midi_range = max_midi - min_midi
+		min_midi = min(plot_notes) if plot_notes else 48
+		max_midi = max(plot_notes) if plot_notes else 84
 		
 		# Draw pianoroll background (notes as semi-transparent rectangles)
-		for idx, note in enumerate(notes_data):
-			# Draw a rectangle from (idx, note-0.4) to (idx+1, note+0.4)
-			# Use a light color with low alpha so IC line shows on top
-			rect = plt.Rectangle((idx - 0.5, note - 0.4), 1, 0.8, 
-								 facecolor='#3d3d5c', alpha=0.4, edgecolor='#6666aa', linewidth=0.5)
-			ax.add_patch(rect)
+		if use_exact_timing:
+			for event in plot_events:
+				start_beats = event['start_ticks'] / ticks_per_beat
+				duration_beats = event['duration_ticks'] / ticks_per_beat
+				rect = plt.Rectangle(
+					(start_beats, event['pitch'] - 0.4),
+					duration_beats,
+					0.8,
+					facecolor='#3d3d5c',
+					alpha=0.4,
+					edgecolor='#6666aa',
+					linewidth=0.5,
+				)
+				ax.add_patch(rect)
+		else:
+			for idx, note in enumerate(notes_data):
+				rect = plt.Rectangle(
+					(idx - 0.5, note - 0.4),
+					1,
+					0.8,
+					facecolor='#3d3d5c',
+					alpha=0.4,
+					edgecolor='#6666aa',
+					linewidth=0.5,
+				)
+				ax.add_patch(rect)
 		
 		# Create a secondary axis for IC values (top/right)
 		ax2 = ax.twinx()
 		
 		# Plot IC data on secondary y-axis (right side)
-		ax2.plot(ic_data, color='#00ff00', linewidth=2.5, label='IC (bits)', zorder=10)
-		ax2.scatter(range(len(ic_data)), ic_data, color='#00ff00', s=60, alpha=0.7, zorder=9)
+		ax2.plot(x_values, plot_ic_data, color='#00ff00', linewidth=2.5, label='IC (bits)', zorder=10)
+		ax2.scatter(x_values, plot_ic_data, color='#00ff00', s=60, alpha=0.7, zorder=9)
 		
 		# Highlight latest point
-		if len(ic_data) > 0:
-			ax2.scatter(len(ic_data) - 1, ic_data[-1], color='#ffff00', s=180, marker='o', 
+		if len(plot_ic_data) > 0:
+			ax2.scatter(x_values[-1], plot_ic_data[-1], color='#ffff00', s=180, marker='o',
 					   edgecolors='white', linewidth=2, zorder=11, label='Latest')
 		
 		# Styling for pianoroll axis (left y-axis - MIDI notes)
-		ax.set_xlabel('Sample #', fontsize=12, color='#cccccc')
+		ax.set_xlabel('Time (beats)' if use_exact_timing else 'Sample #', fontsize=12, color='#cccccc')
 		ax.set_ylabel('MIDI Note', fontsize=12, color='#6666aa')
 		ax.set_ylim(min_midi - 1, max_midi + 1)
+		if x_values:
+			if use_exact_timing:
+				x_min = min(x_values)
+				x_max = max(x_ends) if x_ends else max(x_values)
+				margin = max(0.25, (x_max - x_min) * 0.02)
+				ax.set_xlim(x_min - margin, x_max + margin)
+			else:
+				ax.set_xlim(-0.5, max(x_values) + 0.5)
 		ax.tick_params(axis='y', labelcolor='#6666aa')
 		
 		# Styling for IC axis (right y-axis)
@@ -2391,7 +2747,7 @@ def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
 		ax2.tick_params(axis='y', labelcolor='#00ff00')
 		
 		# Title and grid
-		ax.set_title(f'IC Evolution with Pianoroll - {len(ic_data)} samples', 
+		ax.set_title(f'IC Evolution with Pianoroll - {len(plot_ic_data)} samples',
 					fontsize=14, color='#e6e6ff', fontweight='bold')
 		ax.grid(True, alpha=0.2, color='#4d4d66', axis='x')
 		
@@ -2419,14 +2775,15 @@ def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
 			"message": f"Plot exported successfully",
 			"file": plot_filename,
 			"path": str(filepath),
-			"samples": len(ic_data),
-			"max_ic": max(ic_data) if ic_data else 0,
-			"min_ic": min(ic_data) if ic_data else 0,
-			"avg_ic": sum(ic_data) / len(ic_data) if ic_data else 0,
-			"midi_notes": len(notes_data)
+			"samples": len(plot_ic_data),
+			"max_ic": max(plot_ic_data) if plot_ic_data else 0,
+			"min_ic": min(plot_ic_data) if plot_ic_data else 0,
+			"avg_ic": sum(plot_ic_data) / len(plot_ic_data) if plot_ic_data else 0,
+			"midi_notes": len(plot_notes),
+			"exact_midi_timing": use_exact_timing
 		}
-		if midi_file:
-			response["midi_file"] = str(midi_file)
+		if source_midi_file:
+			response["midi_file"] = str(source_midi_file)
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		add_log(f"  [{addr[1]}] Plot exported: {plot_filename}")
 		add_log(f"  [{addr[1]}] Location: {filepath}")
@@ -2437,8 +2794,8 @@ def export_ic_plot(addr, conn, output_folder, filename=None, midi_file=None):
 			"status": "error",
 			"message": f"Failed to generate plot: {str(e)}"
 		}
-		if midi_file:
-			response["midi_file"] = str(midi_file)
+		if 'source_midi_file' in locals() and source_midi_file:
+			response["midi_file"] = str(source_midi_file)
 		conn.sendall((json.dumps(response) + "\n").encode('utf8'))
 		add_log(f"  [{addr[1]}] Export error: {e}")
 

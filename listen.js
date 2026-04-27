@@ -112,6 +112,41 @@ if (!inNode) {
 		}
 	}
 
+	function parseFiniteNumber(value) {
+		var parsed = parseFloat(value);
+		return isFinite(parsed) ? parsed : null;
+	}
+
+	function addLiveNoteArgs(params, args, startIndex) {
+		var velocity = parseFiniteNumber(args[startIndex]);
+		if (velocity !== null) params.velocity = velocity;
+
+		var third = parseFiniteNumber(args[startIndex + 1]);
+		var fourth = parseFiniteNumber(args[startIndex + 2]);
+		if (third !== null) {
+			if (fourth !== null) {
+				params.duration_ms = third;
+				params.channel = fourth;
+			} else if (Math.floor(third) === third && third >= 0 && third <= 16) {
+				params.channel = third;
+			} else {
+				params.duration_ms = third;
+			}
+		}
+	}
+
+	function sendLiveNote(selector, args) {
+		if (!args || args.length === 0) return;
+		var note = parseInt(args[0]);
+		if (!isFinite(note)) return;
+
+		var params = {};
+		params[selector] = note;
+		params.client_time_ms = Date.now();
+		addLiveNoteArgs(params, args, 1);
+		sendParameter(params);
+	}
+
 	function flattenArgs(args) {
 		var flattened = [];
 		function add(value) {
@@ -437,9 +472,26 @@ if (!inNode) {
 			// Python server now handles both numeric and string formats
 			sendParameter({mode: val});
 		});
-		maxApi.addHandler('user_note', function(note) {
-			// Send user-played note to server in interact mode
-			sendParameter({user_note: parseInt(note)});
+		maxApi.addHandler('user_note', function() {
+			// Accept note-ons as either:
+			//   user_note pitch
+			//   user_note pitch velocity
+			//   user_note pitch velocity channel
+			//   user_note pitch velocity duration_ms channel
+			// If velocity is 0, treat it as a note-off so live durations can be captured.
+			var args = Array.prototype.slice.call(arguments);
+			var velocity = parseFiniteNumber(args[1]);
+			if (velocity !== null && velocity <= 0) {
+				sendLiveNote('user_note_off', args);
+			} else {
+				sendLiveNote('user_note', args);
+			}
+		});
+		maxApi.addHandler('user_note_on', function() {
+			sendLiveNote('user_note_on', Array.prototype.slice.call(arguments));
+		});
+		maxApi.addHandler('user_note_off', function() {
+			sendLiveNote('user_note_off', Array.prototype.slice.call(arguments));
 		});
 		maxApi.addHandler('train_note', function(note) {
 			// Send training note to server in train mode
